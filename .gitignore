@@ -1,0 +1,37 @@
+# Compiled binaries
+hmpplay
+hmpplay_opl3
+hogtool
+
+# Object files and build artifacts
+*.o
+*.a
+*.so
+
+# Build directories
+build/
+out/
+
+# Extracted game files (not part of the repo)
+banks/
+music/
+*.hog
+*.hmp
+*.bnk
+*.rdl
+*.rl2
+*.pig
+*.256
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Linux core dumps
+core
