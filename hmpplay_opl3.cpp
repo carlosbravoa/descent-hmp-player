@@ -232,9 +232,16 @@ static std::vector<uint8_t> hmp_to_smf(const HmpFile &hmp, int device) {
         }
     }
 
-    // time_div: DXX-Rebirth derives this as hmp->tempo * 1.6
-    int time_div = (int)(hmp.tempo * 1.6);
-    if (time_div <= 0) time_div = 60;
+    // Timing derivation:
+    // The original HMI engine plays at: us_per_tick = 1,605,632 / (hmp->tempo * 1.6)
+    // We encode that into standard MIDI using the 500,000 us/beat default tempo
+    // so timing is correct regardless of whether libADLMIDI honors Set Tempo events:
+    //   time_div = round(500,000 / us_per_tick)
+    //            = round(500,000 * hmp->tempo * 1.6 / 1,605,632)
+    // Error vs ideal: <0.4% (inaudible rounding artefact).
+    static constexpr double HMP_TEMPO_US = 1605632.0;
+    double us_per_tick = HMP_TEMPO_US / (hmp.tempo * 1.6);
+    int time_div = std::max(1, (int)std::round(500000.0 / us_per_tick));
 
     std::vector<uint8_t> smf;
     smf.insert(smf.end(), {'M','T','h','d'});
@@ -243,11 +250,13 @@ static std::vector<uint8_t> hmp_to_smf(const HmpFile &hmp, int device) {
     write_be16(smf, (uint16_t)hmp.num_tracks);
     write_be16(smf, (uint16_t)time_div);
 
-    // Tempo track: Set Tempo = 0x188000 = 1,605,632 µs/beat (DXX-Rebirth value)
+    // Tempo track: Set Tempo = 500,000 us/beat (standard MIDI default, 120 BPM).
+    // time_div is already scaled so that 500,000/time_div = target us/tick,
+    // making timing correct even if the sequencer ignores this meta event.
     {
         std::vector<uint8_t> t;
         t.push_back(0x00);                           // delta 0
-        t.insert(t.end(), {0xFF,0x51,0x03, 0x18,0x80,0x00}); // Set Tempo
+        t.insert(t.end(), {0xFF,0x51,0x03, 0x07,0xA1,0x20}); // Set Tempo 500,000
         t.push_back(0x00);                           // delta 0
         t.insert(t.end(), {0xFF,0x2F,0x00});         // End of Track
         smf.insert(smf.end(), {'M','T','r','k'});
