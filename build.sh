@@ -12,8 +12,7 @@ set -euo pipefail
 # ── Sanitize LD_LIBRARY_PATH ──────────────────────────────────────────────────
 # Some third-party IDEs (e.g. Gowin) prepend their own lib directory containing
 # an older libstdc++.so.6, which breaks cmake and g++ when the system needs a
-# newer ABI. Strip any path that ships a foreign libstdc++ from the search path
-# so the real system libraries are used for this build.
+# newer ABI. Strip any path that ships a foreign libstdc++ from the search path.
 if [ -n "${LD_LIBRARY_PATH:-}" ]; then
     CLEAN_LLP=""
     IFS=: read -ra LLP_PARTS <<< "$LD_LIBRARY_PATH"
@@ -39,10 +38,47 @@ if [ ! -d "$LIBADLMIDI_DIR/.git" ]; then
     echo ">>> Cloning libADLMIDI..."
     git clone --depth=1 https://github.com/Wohlstand/libADLMIDI.git "$LIBADLMIDI_DIR"
 else
-    echo ">>> libADLMIDI already cloned (run 'git pull' inside $LIBADLMIDI_DIR to update)"
+    echo ">>> libADLMIDI already cloned"
 fi
 
-# ── 2. Build libADLMIDI (skip if 'fast' argument given and lib already exists) ─
+# ── 2. Patch baud rate support ────────────────────────────────────────────────
+# libADLMIDI's ChipSerialPort::baud2enum() caps at B230400, which corrupts
+# data to the RetroWave OPL3 Express that requires exactly 2,000,000 baud.
+# B2000000 is a standard Linux termios constant — we just need to expose it.
+SERIAL_MISC="$LIBADLMIDI_DIR/src/chips/opl_serial_misc.h"
+python3 - "$SERIAL_MISC" << 'PYEOF'
+import re, sys
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    src = f.read()
+
+if 'B2000000' in src:
+    print(">>> Baud rate patch already applied")
+    sys.exit(0)
+
+patched = re.sub(
+    r'(        else if\(baud <= 115200\)\n            return B115200;\n        else\n            return B230400;)',
+    ('        else if(baud <= 115200)\n            return B115200;\n'
+     '        else if(baud <= 230400)\n            return B230400;\n'
+     '        else if(baud <= 1000000)\n            return B1000000;\n'
+     '        else if(baud <= 1152000)\n            return B1152000;\n'
+     '        else if(baud <= 1500000)\n            return B1500000;\n'
+     '        else if(baud <= 2000000)\n            return B2000000;\n'
+     '        else\n            return B2000000;'),
+    src,
+    count=1  # only the Linux section, not the Win32 one
+)
+
+if patched != src:
+    with open(path, 'w') as f:
+        f.write(patched)
+    print(">>> Baud rate patch applied (added B2000000 support)")
+else:
+    print(">>> WARNING: baud rate patch target not found — check opl_serial_misc.h manually")
+PYEOF
+
+# ── 3. Build libADLMIDI (skip if 'fast' argument given and lib already exists) ─
 LIBFILE="$INSTALL_DIR/lib/libADLMIDI.a"
 
 if [ "${1:-}" = "fast" ] && [ -f "$LIBFILE" ]; then
@@ -71,7 +107,7 @@ else
     echo ">>> libADLMIDI installed to $INSTALL_DIR"
 fi
 
-# ── 3. Compile hmpplay_opl3 ───────────────────────────────────────────────────
+# ── 4. Compile hmpplay_opl3 ───────────────────────────────────────────────────
 echo ">>> Compiling hmpplay_opl3..."
 g++ -std=c++17 -O2 -Wall -Wextra \
     -I"$INSTALL_DIR/include" \
@@ -84,6 +120,6 @@ echo ""
 echo ">>> Done: $SCRIPT_DIR/hmpplay_opl3"
 echo ""
 echo "Usage:"
-echo "  ./hmpplay_opl3 ./music/"
-echo "  ./hmpplay_opl3 --bank int -l ./music/"
+echo "  ./hmpplay_opl3 ./music/          # auto-detects intmelo/intdrum.bnk"
+echo "  ./hmpplay_opl3 -l ./music/       # loop"
 echo "  ./hmpplay_opl3 --bank d2 ./music/"
