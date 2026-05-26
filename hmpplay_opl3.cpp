@@ -71,7 +71,6 @@ static constexpr int HMP_DEVICE_OPL  = 0;
 static constexpr int HMP_DEVICE_MT32 = 1;
 static constexpr int HMP_DEVICE_GM   = 2;
 static constexpr int HMP_DEVICE_GS   = 3;
-static const char *HMP_DEVICE_NAMES[5] = {"OPL/AdLib","MT-32","GM","Roland GS","Tandy"};
 
 static int read_hmi_var(const uint8_t *p, int len, uint32_t *out) {
     uint32_t v = 0; int shift = 0;
@@ -210,27 +209,14 @@ static std::vector<uint8_t> hmp_track_to_midi(const HmpTrack &trk, bool active) 
     return out;
 }
 
-static std::vector<uint8_t> hmp_to_smf(const HmpFile &hmp, int device) {
-    // Build active-track set from device map
+static std::vector<uint8_t> hmp_to_smf(const HmpFile &hmp, int /*device*/) {
+    // Include all music tracks (1..N), exactly as DXX-Rebirth hmp2mid() does.
+    // The deviceTrackMappings in the HMP header is only relevant when sending
+    // raw MIDI to hardware (e.g. MT-32 needs MT-32-specific tracks). For OPL
+    // synthesis via libADLMIDI, all tracks should play — libADLMIDI handles
+    // the OPL register generation from whatever MIDI events it receives.
     std::vector<bool> active(hmp.num_tracks, true);
-    active[0] = false;
-
-    if (device >= 0 && device <= 4 && hmp.has_device_map) {
-        std::fill(active.begin(), active.end(), false);
-        int mapped = 0;
-        for (int slot = 0; slot < 32; slot++) {
-            uint32_t ti = hmp.device_track_map[device][slot];
-            if (ti > 0 && (int)ti < hmp.num_tracks) { active[ti] = true; mapped++; }
-        }
-        if (mapped == 0) {
-            printf("  Warning: no tracks for device %d (%s), playing all\n",
-                   device, HMP_DEVICE_NAMES[device]);
-            for (int i = 1; i < hmp.num_tracks; i++) active[i] = true;
-        } else {
-            printf("  Device %d (%s): %d mapped tracks\n",
-                   device, HMP_DEVICE_NAMES[device], mapped);
-        }
-    }
+    active[0] = false; // track 0 is the HMP conductor track, always skip
 
     // Timing derivation:
     // The original HMI engine plays at: us_per_tick = 1,605,632 / (hmp->tempo * 1.6)
