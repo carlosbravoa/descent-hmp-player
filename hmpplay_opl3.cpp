@@ -342,12 +342,6 @@ void key_thread_fn(PlayOptions *opts) {
 // Playback
 // ─────────────────────────────────────────────────────────────────────────────
 
-// libADLMIDI native sample rate
-static constexpr long ADLMIDI_SAMPLE_RATE = 49716;
-// Chunk size: ~20ms. Even for hardware chips we need to call adl_play()
-// to advance the sequencer; nativeGenerate() outputs silence for serial chip.
-static constexpr int  CHUNK_SAMPLES = 1024;
-
 // We need a global player pointer so the key thread can call adl_setTempo
 static ADL_MIDIPlayer *g_adl = nullptr;
 
@@ -391,18 +385,49 @@ void play_hmp(ADL_MIDIPlayer *adl, const HmpFile &hmp, const PlayOptions &opts) 
     printf("  time_div=%d  tracks=%d\n",
            (int)(hmp.tempo * 1.6), hmp.num_tracks);
 
-    // Dummy PCM buffer — for the serial chip, adl_play() drives the sequencer
-    // and sends OPL register writes out the serial port; PCM output is silence.
-    std::vector<int16_t> pcm(CHUNK_SAMPLES * 2, 0);
+    // For a hardware serial chip, adl_play() renders silence instantly —
+    // there is no audio device to pace it, so the sequencer races at CPU speed.
+    // Instead we use adl_tickEventsOnly() (designed for hardware OPL mode):
+    //   - it advances the sequencer by `seconds` and fires OPL register writes
+    //   - returns the number of seconds until the next call is needed
+    //   - WE are responsible for sleeping that duration (real wall-clock time)
+    // adl_tickIterators() handles vibrato/arpeggio/portamento interpolation.
+    using clock = std::chrono::steady_clock;
+    using dur   = std::chrono::duration<double>;
+
+    // Granularity: minimum MIDI tick size in seconds.
+    // 1 ms is fine — smaller than any audible timing difference.
+    static constexpr double GRANULARITY = 0.001;
 
     do {
         adl_positionRewind(adl);
+        double prev_delay = 0.0;
+
         while (!g_stop && !g_skip) {
-            int done = adl_play(adl, CHUNK_SAMPLES * 2, pcm.data());
-            if (done <= 0) break;
+            auto t0 = clock::now();
+
+            // Advance sequencer: fires OPL register writes to the serial port
+            double next_delay = adl_tickEventsOnly(adl, prev_delay, GRANULARITY);
+
+            // Handle vibrato / arpeggio / portamento
+            adl_tickIterators(adl, prev_delay);
+
+            if (next_delay < 0.0) break;   // error
+            if (next_delay == 0.0) break;  // end of song
+
+            // Sleep the remaining real time until the next tick is due,
+            // accounting for the time adl_tickEventsOnly() itself took
+            auto elapsed = std::chrono::duration_cast<dur>(clock::now() - t0).count();
+            double sleep_s = next_delay - elapsed;
+            if (sleep_s > 0.0)
+                std::this_thread::sleep_for(dur(sleep_s));
+
+            prev_delay = next_delay;
         }
+
         if (opts.loop && !g_stop && !g_skip)
             printf("  [Looping...]\n");
+
     } while (opts.loop && !g_stop && !g_skip);
 }
 
@@ -514,7 +539,7 @@ int main(int argc, char *argv[]) {
     if (files.empty()) { fprintf(stderr,"Error: no .hmp files\n"); return 1; }
 
     // ── Init libADLMIDI ───────────────────────────────────────────────────────
-    ADL_MIDIPlayer *adl = adl_init(ADLMIDI_SAMPLE_RATE);
+    ADL_MIDIPlayer *adl = adl_init(49716); // native OPL sample rate
     if (!adl) { fprintf(stderr,"adl_init failed\n"); return 1; }
     g_adl = adl;
 
