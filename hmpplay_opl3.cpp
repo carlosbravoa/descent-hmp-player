@@ -458,6 +458,220 @@ static std::vector<std::string> expand_args(const std::vector<const char *> &arg
     return result;
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HMI AdLib BNK parser and BNK → WOPL in-memory converter
+//
+// Loads intmelo.bnk (melodic) + intdrum.bnk (percussion) and builds a
+// WOPLFile in memory that adl_openBankData() can consume directly.
+// This gives libADLMIDI the actual original FM patches from the game.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One operator's worth of BNK data (13 bytes per op in the PackedTimbre)
+struct BnkOp {
+    uint8_t ksl, multiple, feedback, attack, sustain, eg, decay, rel;
+    uint8_t totalLevel, am, vib, ksr, con;
+};
+
+struct BnkInst {
+    bool     valid{false};
+    bool     percussive{false};
+    uint8_t  voice_num{0};   // percussion MIDI note
+    BnkOp    op[2];          // op[0]=modulator, op[1]=carrier
+    uint8_t  mod_wave{0}, car_wave{0};
+};
+
+// Parse one HMI .bnk file into a vector of 128 instruments.
+static std::vector<BnkInst> load_bnk_file(const char *path) {
+    std::vector<BnkInst> bank(128);
+    FILE *f = fopen(path, "rb");
+    if (!f) return bank; // returns all-invalid on failure
+
+    uint8_t hdr[24];
+    if (fread(hdr, 1, 24, f) != 24 || memcmp(hdr+2, "ADLIB-", 6) != 0) {
+        fclose(f); return bank;
+    }
+    uint16_t num_used   = hdr[8]  | (hdr[9]  << 8);
+    uint32_t offset_name = hdr[12] | (hdr[13]<<8) | (hdr[14]<<16) | (hdr[15]<<24);
+    uint32_t offset_data = hdr[16] | (hdr[17]<<8) | (hdr[18]<<16) | (hdr[19]<<24);
+
+    fseek(f, offset_name, SEEK_SET);
+    for (int i = 0; i < (int)num_used; i++) {
+        uint8_t ne[12];
+        if (fread(ne, 1, 12, f) != 12) break;
+        uint16_t data_idx = ne[0] | (ne[1] << 8);
+        if (data_idx >= 128) continue;
+
+        long saved = ftell(f);
+        fseek(f, offset_data + data_idx * 30, SEEK_SET);
+        uint8_t d[30];
+        if (fread(d, 1, 30, f) != 30) { fseek(f, saved, SEEK_SET); continue; }
+        fseek(f, saved, SEEK_SET);
+
+        BnkInst &ins = bank[data_idx];
+        ins.valid      = true;
+        ins.percussive = d[0] != 0;
+        ins.voice_num  = d[1];
+        for (int op = 0; op < 2; op++) {
+            const uint8_t *b = d + 2 + op * 13;
+            ins.op[op] = {b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12]};
+        }
+        ins.mod_wave = d[28];
+        ins.car_wave = d[29];
+    }
+    fclose(f);
+    return bank;
+}
+
+// Build a WOPL v2 binary blob from melodic + percussion BnkInst vectors.
+// Layout verified against libADLMIDI src/wopl/wopl_file.c WOPL_parseInstrument().
+// Returns raw bytes for adl_openBankData(), or empty on failure.
+static std::vector<uint8_t> bnk_pair_to_wopl(
+        const std::vector<BnkInst> &mel,
+        const std::vector<BnkInst> &drm) {
+
+    // WOPL uses big-endian for most multi-byte fields (note offsets, bank counts).
+    // Version field and total inst size are little-endian.
+    auto wbe16 = [](std::vector<uint8_t> &b, int16_t v) {
+        b.push_back((v >> 8) & 0xFF); b.push_back(v & 0xFF);
+    };
+    auto wle16 = [](std::vector<uint8_t> &b, uint16_t v) {
+        b.push_back(v & 0xFF); b.push_back((v >> 8) & 0xFF);
+    };
+    auto wbyte = [](std::vector<uint8_t> &b, uint8_t v) { b.push_back(v); };
+    auto wpad  = [](std::vector<uint8_t> &b, int n)  { b.insert(b.end(), n, 0); };
+    auto wstr  = [](std::vector<uint8_t> &b, const char *s, int len) {
+        int sl = s ? (int)strlen(s) : 0;
+        for (int i = 0; i < len; i++) b.push_back(i < sl ? (uint8_t)s[i] : 0);
+    };
+
+    // Write one 5-byte operator block (offsets 42+l*5 in v2 instrument)
+    auto write_op = [&](std::vector<uint8_t> &b, const BnkOp &op, uint8_t wave) {
+        wbyte(b, (op.am?0x80:0)|(op.vib?0x40:0)|(op.eg?0x20:0)|(op.ksr?0x10:0)|(op.multiple&0x0F));
+        wbyte(b, (op.ksl<<6)|(op.totalLevel&0x3F));
+        wbyte(b, (op.attack<<4)|(op.decay&0x0F));
+        wbyte(b, (op.sustain<<4)|(op.rel&0x0F));
+        wbyte(b, wave & 0x07);
+    };
+
+    // Write one 62-byte v2 instrument block.
+    // Exact layout from WOPL_parseInstrument() in wopl_file.c:
+    //   [0..31]  inst_name (32 bytes, then  )         — we write 32 chars
+    //   [32]     inst_name[32] = ' ' added by parser   — we write it
+    //   [32..33] note_offset1  sint16 BE
+    //   [34..35] note_offset2  sint16 BE
+    //   [36]     midi_velocity_offset
+    //   [37]     second_voice_detune
+    //   [38]     percussion_key_number
+    //   [39]     inst_flags  (0x08 = blank)
+    //   [40]     fb_conn1_C0
+    //   [41]     fb_conn2_C0
+    //   [42..46] operator 0 (5 bytes)
+    //   [47..51] operator 1 (5 bytes)
+    //   [52..56] operator 2 (5 bytes, zeros for 2-op)
+    //   [57..61] operator 3 (5 bytes, zeros for 2-op)
+    //   Total = 62 bytes = WOPL_INST_SIZE_V2
+    auto write_inst = [&](std::vector<uint8_t> &b, const BnkInst &ins, int prog) {
+        char name[33]{}; snprintf(name, 33, "ins_%03d", prog);
+        wstr(b, name, 32);          // [0..31]
+        wbyte(b, 0);                // [32] null terminator part of name field
+        wbe16(b, 0);                // [33..34] note_offset1
+        wbe16(b, 0);                // [35..36] note_offset2  (note: parser reads 32,34)
+        // ^^^ The parser reads note_offset1 at cursor+32, note_offset2 at cursor+34,
+        //     but the name is 32 bytes NOT including the null — parser adds null manually.
+        //     So inst_name is bytes [0..31] (32 bytes), null at [32], then offsets at [32..35].
+        //     Wait — strncpy(name, cursor, 32) then name[32]=' ' means the stored name
+        //     is bytes [0..31] and the null is NOT in the binary. Then note_offset1 is
+        //     at cursor+32. So no null byte between name and offsets. Let me fix:
+        // Actually re-read: strncpy copies 32 bytes from cursor[0], sets cursor[32]=0 in
+        // the struct but doesn't advance cursor. note_offset1 = toSint16BE(cursor+32).
+        // So bytes [0..31]=name, [32..33]=note_offset1 BE, [34..35]=note_offset2 BE.
+        // We wrote one too many bytes above. Let me redo:
+        b.resize(b.size() - 3); // undo the 0 + wbe16(0)
+        wbe16(b, 0);                // [32..33] note_offset1 BE
+        wbe16(b, 0);                // [34..35] note_offset2 BE
+        wbyte(b, 0);                // [36] midi_velocity_offset
+        wbyte(b, 0);                // [37] second_voice_detune
+        wbyte(b, ins.valid && ins.percussive ? ins.voice_num : 0); // [38]
+        wbyte(b, ins.valid ? 0x00 : 0x08); // [39] inst_flags (0x08=blank)
+        // fb_conn1_C0 [40]: connection(bit0) | feedback(bits1-3) | OPL3-enable(bits4-5=0x30)
+        // BNK 'con' field: 0=FM(carrier output) meaning OPL con bit=1 (additive=off)
+        //                  non-zero=additive meaning OPL con bit=0
+        uint8_t con_bit = (ins.valid && ins.op[0].con == 0) ? 1 : 0;
+        uint8_t fb      = ins.valid ? (uint8_t)((ins.op[0].feedback & 0x07) << 1) : 0;
+        wbyte(b, fb | con_bit | 0x30); // [40] fb_conn1_C0
+        wbyte(b, 0x30);            // [41] fb_conn2_C0 (4-op only)
+        if (ins.valid) {
+            write_op(b, ins.op[0], ins.mod_wave); // [42..46]
+            write_op(b, ins.op[1], ins.car_wave); // [47..51]
+        } else {
+            wpad(b, 10);           // [42..51] silence
+        }
+        wpad(b, 10);               // [52..61] ops 2,3 (zeros for 2-op)
+        // Total so far: 32 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 10 + 10 = 62 ✓
+    };
+
+    // Bank header v2: 32-byte name + lsb(1) + msb(1) = 34 bytes
+    auto write_bank_hdr = [&](std::vector<uint8_t> &b, const char *name) {
+        wstr(b, name, 32);
+        wbyte(b, 0); // lsb
+        wbyte(b, 0); // msb
+    };
+
+    std::vector<uint8_t> out;
+
+    // File header:
+    //  [0..10]  magic "WOPL3-BANK " (11 bytes)
+    //  [11..12] version uint16 LE = 2
+    //  [13..14] banks_melodic uint16 BE
+    //  [15..16] banks_percussion uint16 BE
+    //  [17]     opl_flags
+    //  [18]     volume_model
+    const char *magic = "WOPL3-BANK";
+    out.insert(out.end(), magic, magic + 11); // includes  
+    wle16(out, 2);      // version 2 (LE)
+    // bank counts are big-endian (parsed with toUint16BE in wopl_file.c)
+    out.push_back(0); out.push_back(1); // banks_melodic = 1 (BE)
+    out.push_back(0); out.push_back(1); // banks_percussion = 1 (BE)
+    wbyte(out, 0x03);   // opl_flags: deep tremolo + deep vibrato
+    wbyte(out, 0x0A);   // volume_model: HMI = 10
+
+    // Bank names (v2 only: melodic banks first, then percussion)
+    write_bank_hdr(out, "Descent Int Melodic");
+    write_bank_hdr(out, "Descent Int Drums");
+
+    // Instruments: all melodic banks, then all percussion banks
+    for (int i = 0; i < 128; i++)
+        write_inst(out, i < (int)mel.size() ? mel[i] : BnkInst{}, i);
+    for (int i = 0; i < 128; i++)
+        write_inst(out, i < (int)drm.size() ? drm[i] : BnkInst{}, i);
+
+    return out;
+}
+
+// Look for intmelo.bnk + intdrum.bnk next to the given path (file or dir).
+// Returns the directory to search, or empty string if not found.
+static std::string find_bnk_dir(const std::string &hmp_path) {
+    // Try the directory containing the HMP file
+    std::string dir = hmp_path;
+    auto slash = dir.rfind('/');
+    if (slash != std::string::npos)
+        dir = dir.substr(0, slash);
+    else
+        dir = ".";
+
+    auto exists = [](const std::string &p) {
+        struct stat st; return stat(p.c_str(), &st) == 0;
+    };
+
+    if (exists(dir + "/intmelo.bnk") && exists(dir + "/intdrum.bnk"))
+        return dir;
+    // Also try current directory
+    if (exists("./intmelo.bnk") && exists("./intdrum.bnk"))
+        return ".";
+    return "";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -468,13 +682,15 @@ static void usage(const char *prog) {
         "\n"
         "Options:\n"
         "  -d name          Serial device name without /dev/ (default: ttyACM0)\n"
-        "  --bank NAME      Built-in instrument bank:\n"
+        "  -m intmelo.bnk   Melodic HMI BNK file (auto-detected if next to HMP)\n"
+        "  -r intdrum.bnk   Percussion HMI BNK file (auto-detected if next to HMP)\n"
+        "  -b file.wopl     Load WOPL format bank file\n"
+        "  --bank NAME      Built-in bank fallback if no BNK files found:\n"
         "                     int   HMI (Descent Int)   [default, OPL/AdLib]\n"
         "                     ham   HMI (Descent Ham)\n"
         "                     rick  HMI (Descent Rick)\n"
         "                     d2    HMI (Descent 2)\n"
         "                     gm    HMI (Descent, Asterix)  [GM-ish]\n"
-        "  -b file.bnk      Load external AdLib BNK file (overrides --bank)\n"
         "  -D N             HMP device track selection (default: 0=OPL)\n"
         "                     0=OPL  1=MT-32  2=GM  3=Roland GS\n"
         "  -l               Loop playlist indefinitely\n"
@@ -484,9 +700,9 @@ static void usage(const char *prog) {
         "\n"
         "Examples:\n"
         "  %s ./music/\n"
-        "  %s --bank int -l ./music/\n"
-        "  %s --bank d2 ./music/\n"
-        "  %s -b ./banks/intmelo.bnk ./music/\n"
+        "  %s -l ./music/                        # auto-detects intmelo/intdrum.bnk\n"
+        "  %s --bank d2 ./music/                 # use built-in Descent 2 bank\n"
+        "  %s -m ./banks/intmelo.bnk -r ./banks/intdrum.bnk ./music/\n"
         "\n"
         "Build: see build.sh\n",
         prog, prog, prog, prog, prog);
@@ -498,6 +714,8 @@ int main(int argc, char *argv[]) {
 
     PlayOptions opts;
     std::vector<const char *> raw_files;
+    const char *mel_path = nullptr; // explicit -m melodic.bnk
+    const char *drm_path = nullptr; // explicit -r drums.bnk
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-d") && i+1 < argc) {
@@ -512,6 +730,10 @@ int main(int argc, char *argv[]) {
             else { fprintf(stderr,"Unknown bank '%s'\n",n); return 1; }
         } else if (!strcmp(argv[i], "-b") && i+1 < argc) {
             opts.bank_file = argv[++i];
+        } else if (!strcmp(argv[i], "-m") && i+1 < argc) {
+            mel_path = argv[++i];
+        } else if (!strcmp(argv[i], "-r") && i+1 < argc) {
+            drm_path = argv[++i];
         } else if (!strcmp(argv[i], "-D") && i+1 < argc) {
             opts.device = atoi(argv[++i]);
             if (opts.device < 0 || opts.device > 4) {
@@ -543,16 +765,69 @@ int main(int argc, char *argv[]) {
     if (!adl) { fprintf(stderr,"adl_init failed\n"); return 1; }
     g_adl = adl;
 
-    // Instrument bank
-    if (!opts.bank_file.empty()) {
+    // ── Instrument bank loading ───────────────────────────────────────────────
+    // Priority:
+    //   1. Explicit -m melodic.bnk + -r drums.bnk  (raw HMI BNK files)
+    //   2. Explicit -b file.wopl                    (WOPL format)
+    //   3. BNK files auto-detected next to HMP files
+    //   4. Built-in embedded bank (--bank flag)
+    bool bank_loaded = false;
+
+    // Helper: load BNK pair and feed to libADLMIDI
+    auto load_bnk_pair = [&](const char *mel, const char *drm) -> bool {
+        auto melodic  = load_bnk_file(mel);
+        auto drums    = load_bnk_file(drm);
+        bool mel_ok   = std::any_of(melodic.begin(), melodic.end(),
+                                    [](const BnkInst &b){ return b.valid; });
+        bool drm_ok   = std::any_of(drums.begin(),   drums.end(),
+                                    [](const BnkInst &b){ return b.valid; });
+        if (!mel_ok && !drm_ok) return false;
+        auto wopl = bnk_pair_to_wopl(melodic, drums);
+        if (wopl.empty()) return false;
+        if (adl_openBankData(adl, wopl.data(), (unsigned long)wopl.size()) != 0) {
+            fprintf(stderr, "BNK load error: %s\n", adl_errorInfo(adl));
+            return false;
+        }
+        printf("Bank: %s + %s\n", mel, drm);
+        return true;
+    };
+
+    if (mel_path || drm_path) {
+        // Explicit BNK files given
+        const char *m = mel_path ? mel_path : "";
+        const char *d = drm_path ? drm_path : "";
+        if (!load_bnk_pair(m, d)) {
+            fprintf(stderr, "Error loading BNK files\n");
+            adl_close(adl); return 1;
+        }
+        bank_loaded = true;
+    }
+
+    if (!bank_loaded && !opts.bank_file.empty()) {
+        // Explicit WOPL file
         if (adl_openBankFile(adl, opts.bank_file.c_str()) != 0) {
-            fprintf(stderr,"Bank file error: %s\n", adl_errorInfo(adl));
+            fprintf(stderr, "Bank file error: %s\n", adl_errorInfo(adl));
             adl_close(adl); return 1;
         }
         printf("Bank: %s\n", opts.bank_file.c_str());
-    } else {
+        bank_loaded = true;
+    }
+
+    if (!bank_loaded && !files.empty()) {
+        // Auto-detect intmelo.bnk + intdrum.bnk next to the first HMP file
+        std::string bnk_dir = find_bnk_dir(files[0]);
+        if (!bnk_dir.empty()) {
+            std::string m = bnk_dir + "/intmelo.bnk";
+            std::string d = bnk_dir + "/intdrum.bnk";
+            if (load_bnk_pair(m.c_str(), d.c_str()))
+                bank_loaded = true;
+        }
+    }
+
+    if (!bank_loaded) {
+        // Fall back to built-in embedded bank
         if (adl_setBank(adl, opts.bank_no) != 0) {
-            fprintf(stderr,"Bank %d error: %s\n", opts.bank_no, adl_errorInfo(adl));
+            fprintf(stderr, "Bank %d error: %s\n", opts.bank_no, adl_errorInfo(adl));
             adl_close(adl); return 1;
         }
         printf("Bank: built-in #%d — %s\n", opts.bank_no, adl_getBankNames()[opts.bank_no]);
