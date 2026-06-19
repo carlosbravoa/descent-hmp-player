@@ -46,13 +46,21 @@ needed to pull the music and instrument banks out of the game files.
 
 ```bash
 sudo apt install libasound2-dev   # hmpplay only
-sudo apt install cmake             # hmpplay_opl3 (builds the bundled libADLMIDI)
+sudo apt install cmake             # hmpplay_opl3 (builds libADLMIDI)
 # hogtool needs nothing beyond libc
 ```
 
-`hmpplay_opl3` is built by `./build.sh`, which compiles the bundled `libADLMIDI/`
-(patched for the RetroWave's 2 Mbaud serial rate) and then the player. Use
-`./build.sh fast` to rebuild just the player after editing it.
+`hmpplay_opl3` depends on **libADLMIDI**, included as a git submodule. Clone with:
+
+```bash
+git clone --recurse-submodules <this-repo>
+# already cloned without it? grab it (or just run ./build.sh, which does this):
+git submodule update --init
+```
+
+`./build.sh` initialises the submodule if needed, patches it for the RetroWave's 2 Mbaud
+serial rate, builds it, then compiles the player. `./build.sh fast` rebuilds just the
+player after editing it.
 
 ---
 
@@ -385,5 +393,8 @@ then, repeated until EOF:
 - HMP header layout from [ScummVM](https://github.com/scummvm/scummvm)
   `audio/midiparser_hmp.cpp` (GPL v3+)
 - HOG format from DXX-Rebirth utilities by Josh Cogliati and Bradley Bell (GPL v2+)
+- OPL3 FM synthesis + built-in Descent banks from
+  [libADLMIDI](https://github.com/Wohlstand/libADLMIDI) by Vitaly Novichkov (LGPL v2.1+),
+  included as a submodule
 - RetroWave wire protocol from [SudoMaker/RetroWave](https://github.com/SudoMaker/RetroWave)
   `RetroWaveLib/` (AGPLv3)

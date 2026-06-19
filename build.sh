@@ -33,12 +33,19 @@ LIBADLMIDI_DIR="$SCRIPT_DIR/libADLMIDI"
 BUILD_DIR="$SCRIPT_DIR/build/libadlmidi"
 INSTALL_DIR="$SCRIPT_DIR/build/install"
 
-# ── 1. Fetch libADLMIDI if not present ───────────────────────────────────────
-if [ ! -d "$LIBADLMIDI_DIR/.git" ]; then
-    echo ">>> Cloning libADLMIDI..."
-    git clone --depth=1 https://github.com/Wohlstand/libADLMIDI.git "$LIBADLMIDI_DIR"
+# ── 1. Fetch libADLMIDI (git submodule) ──────────────────────────────────────
+# libADLMIDI is a pinned submodule. Initialise it if the checkout is empty
+# (i.e. the repo was cloned without --recurse-submodules).
+if [ ! -f "$LIBADLMIDI_DIR/CMakeLists.txt" ]; then
+    if [ -f "$SCRIPT_DIR/.gitmodules" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        echo ">>> Initialising libADLMIDI submodule..."
+        git -C "$SCRIPT_DIR" submodule update --init --recursive libADLMIDI
+    else
+        echo ">>> Cloning libADLMIDI..."
+        git clone https://github.com/Wohlstand/libADLMIDI.git "$LIBADLMIDI_DIR"
+    fi
 else
-    echo ">>> libADLMIDI already cloned"
+    echo ">>> libADLMIDI present"
 fi
 
 # ── 2. Patch baud rate support ────────────────────────────────────────────────
@@ -120,6 +127,6 @@ echo ""
 echo ">>> Done: $SCRIPT_DIR/hmpplay_opl3"
 echo ""
 echo "Usage:"
-echo "  ./hmpplay_opl3 ./music/          # auto-detects intmelo/intdrum.bnk"
-echo "  ./hmpplay_opl3 -l ./music/       # loop"
-echo "  ./hmpplay_opl3 --bank d2 ./music/"
+echo "  ./hmpplay_opl3 ./music/          # per-song banks from descent.sng"
+echo "  ./hmpplay_opl3 -l ./music/       # loop the whole soundtrack"
+echo "  ./hmpplay_opl3 --bank int ./music/   # force one bank (A/B testing)"
