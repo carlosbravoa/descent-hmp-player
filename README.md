@@ -9,8 +9,13 @@ Aimed at two targets:
 - **RetroWave OPL3 Express** — direct USB serial playback on real OPL3 hardware, with
   the **correct instrument bank chosen automatically per song** (Descent uses four
   different FM banks across its soundtrack), exactly as it sounded on a real Sound Blaster
-- **Roland MT-32 / MT-32pi** — native MT-32 mode with proper track selection and SysEx
-  init, or GM/soundfont mode for a modern take
+- **General MIDI modules** (Roland SC-55, or an MT-32pi in GM/soundfont mode) — the
+  `.hmp` files played to any ALSA MIDI port
+
+> **Why not native MT-32?** Descent's `.hmp` files carry the dense OPL arrangement
+> (13–16 MIDI channels) with no separate MT-32 track set. A real MT-32 has only 9 parts,
+> so it physically can't voice the whole arrangement — native MT-32 mode was dropped.
+> GM mode plays every channel and is the supported MIDI path.
 
 Also includes **`hogtool`**, a simple extractor for Descent's `.hog` archive format,
 needed to pull the music and instrument banks out of the game files.
@@ -21,7 +26,7 @@ needed to pull the music and instrument banks out of the game files.
 
 | Tool | What it does |
 |---|---|
-| `hmpplay` | Plays `.hmp` files to any ALSA MIDI port (MT-32, GM, Roland GS, …) |
+| `hmpplay` | Plays `.hmp` files to any ALSA MIDI port (General MIDI: SC-55, MT-32pi GM mode, …) |
 | `hmpplay_opl3` | Plays `.hmp` files directly to a RetroWave OPL3 Express via USB serial, with automatic per-song instrument banks |
 | `hogtool` | Lists, extracts, and creates Descent `.hog` archives |
 
@@ -32,8 +37,7 @@ needed to pull the music and instrument banks out of the game files.
 | Device | Tool | Notes |
 |---|---|---|
 | RetroWave OPL3 Express | `hmpplay_opl3` | Direct OPL3 FM synthesis via libADLMIDI, auto-selecting each song's authored Descent bank (Int / Ham / Rick / Asterix) |
-| Roland MT-32pi (MT-32 mode) | `hmpplay --mt32` | Native MT-32 playback with SysEx init — closest to the original DOS experience |
-| Roland MT-32pi (GM mode) | `hmpplay --gm` | GM/soundfont playback — sounds great, slightly less authentic |
+| Roland SC-55 / MT-32pi (GM mode) | `hmpplay` | General MIDI playback — voices all 13–16 channels of the arrangement |
 | RetroWave OPL3 Express | `hmpplay` + [RetroWave MIDI Proxy](https://github.com/SudoMaker/RetroWaveMIDIProxy) | OPL3 via ALSA MIDI — simpler setup but uses proxy's own sound banks |
 
 ---
@@ -71,12 +75,9 @@ gcc -O2 -o hogtool hogtool.c
 ### 2. Play
 
 ```bash
-# MT-32pi in MT-32 mode
+# General MIDI module (SC-55, or MT-32pi in GM mode)
 g++ -std=c++17 -O2 -o hmpplay hmpplay.cpp -lasound
-./hmpplay --mt32 -p 20:0 ./music/
-
-# MT-32pi in GM mode
-./hmpplay --gm -p 20:0 ./music/
+./hmpplay -p 20:0 ./music/
 
 # RetroWave OPL3 Express (direct) — bank auto-selected per song from descent.sng
 ./build.sh
@@ -87,9 +88,9 @@ g++ -std=c++17 -O2 -o hmpplay hmpplay.cpp -lasound
 
 ## hmpplay
 
-Reads `.hmp` files and sends MIDI events to any ALSA sequencer port. Understands the
-HMP file's internal per-device track mapping, so it plays the tracks intended for your
-specific hardware rather than sending everything at once.
+Reads `.hmp` files and sends MIDI events to any ALSA sequencer port — for a **General
+MIDI** module such as a Roland SC-55 or an MT-32pi in GM/soundfont mode. It plays all
+music tracks, so the GM device voices the full arrangement.
 
 ### Build
 
@@ -124,10 +125,7 @@ g++ -std=c++17 -O2 -o hmpplay hmpplay.cpp -lasound
 | `-p client:port` | ALSA destination port (e.g. `128:0`). Prompts if omitted. |
 | `-l` | Loop the playlist indefinitely. |
 | `-t scale` | Tempo multiplier. `0.5` = half speed, `2.0` = double. Default: `1.0`. |
-| `-v` | Verbose — print device track mapping and every MIDI event. |
-| `-D N` | HMP device index for track selection (see table below). |
-| `--mt32` | MT-32 mode: select MT-32 tracks (`-D 1`) and send SysEx init. |
-| `--gm` | GM mode: select General MIDI tracks (`-D 2`), no SysEx. |
+| `-v` | Verbose — print every MIDI event. |
 | `--list` | List available ALSA MIDI output ports and exit. |
 
 ### Keyboard controls
@@ -158,41 +156,27 @@ Available ALSA MIDI output ports:
   128:0  RetroWave MIDI Proxy           RetroWave OPL3
 ```
 
-### MT-32pi — native MT-32 mode
+### Playing to a GM module (SC-55 / MT-32pi GM mode)
 
-Descent's music was originally composed for the Roland MT-32. Playing it back in native
-MT-32 mode is the closest you can get to the original DOS experience.
-
-Switch your MT-32pi to MT-32 mode, connect via MIDI cable to a USB MIDI interface, then:
+Put your module in GM mode, connect it (e.g. a USB MIDI interface), find its ALSA port,
+then:
 
 ```bash
-./hmpplay --mt32 -p 20:0 ./music/
+./hmpplay -p 20:0 ./music/
 ```
 
-`--mt32` does three things:
+That's it — `hmpplay` sends all of the song's tracks, and the GM device provides the
+sounds. There is no device flag to set.
 
-1. **Selects the MT-32 track arrangement** from the HMP file. Each `.hmp` contains
-   separate tracks for different hardware (OPL, MT-32, GM, etc.), with patch numbers and
-   voice layouts tuned for each device. Without `-D 1` you get a mix of all tracks, which
-   sounds wrong on MT-32 hardware.
+#### Why no native MT-32 mode?
 
-2. **Sends SysEx initialisation** before the first note plays:
-   - Master volume = 100
-   - Reverb: Hall mode, time 4, level 4
-   - Partial reserve: 4 voices per part across all 8 melody parts
-
-3. **Sends MIDI panic** (all notes off) between tracks.
-
-### MT-32pi — GM / soundfont mode
-
-Switch the MT-32pi to GM mode and use:
-
-```bash
-./hmpplay --gm -p 20:0 ./music/
-```
-
-`--gm` selects the General MIDI track arrangement and sends no SysEx. It sounds great —
-just less strictly faithful to the original than native MT-32 mode.
+Descent's music was composed with the MT-32 in mind, but the `.hmp` files we extract carry
+the **dense OPL arrangement** — 13–16 MIDI channels — and contain no separate MT-32 track
+set (the per-device track map referenced by older tools isn't actually populated in these
+files). A real MT-32 has only **9 parts**, so it physically cannot voice a 13-channel
+arrangement: switch a real MT-32 (or MT-32pi in MT-32 mode) on and you simply lose the
+extra voices. GM mode has all 16 channels and plays everything, so that's the supported
+MIDI path. (For the authentic FM sound, use `hmpplay_opl3` on OPL3 hardware.)
 
 ### RetroWave OPL3 Express via MIDI Proxy
 
@@ -350,25 +334,18 @@ and skips any file whose basename exceeds this.
 
 ---
 
-## HMP device track mapping
+## A note on per-device arrangements
 
-Each `.hmp` file stores separate track arrangements for different hardware. The player
-reads a `deviceTrackMappings` table from the HMP header and plays only the tracks
-intended for your device:
+The HMP format reserves a `deviceTrackMappings` table (meant to select a different track
+subset per device: OPL, MT-32, GM, GS, Tandy). In Descent's extracted `.hmp` files this
+table is **not populated** — there is no usable per-device subset to select. So both
+players just play all music tracks:
 
-| Index | Device | `hmpplay` flag | Where the instruments come from |
-|---|---|---|---|
-| 0 | OPL / AdLib | `-D 0` | FM patches (`hmpplay_opl3` supplies these automatically) |
-| 1 | Roland MT-32 | `--mt32` | MT-32 ROM patches on the device |
-| 2 | General MIDI | `--gm` | GM patches on the device |
-| 3 | Roland GS | `-D 3` | GS patches on the device |
-| 4 | Tandy / PS/1 | `-D 4` | — |
+- `hmpplay` sends them to a GM module, which voices all 13–16 channels.
+- `hmpplay_opl3` feeds them to libADLMIDI with the per-song FM bank.
 
-This index selects which *track arrangement* to play from the HMP file — it is not a bank
-file you pass in. `hmpplay` sends the chosen tracks to your MIDI device (which provides
-the sounds); `hmpplay_opl3` always uses the OPL arrangement and supplies the FM bank
-itself. Playing `hmpplay` without a `-D` flag merges all tracks, which usually works but
-may include device-specific tracks not suited to your hardware.
+This is also why native MT-32 isn't supported: there is no MT-32-specific arrangement in
+the files, and the full arrangement exceeds the MT-32's 9 parts.
 
 ---
 
@@ -387,7 +364,8 @@ then, repeated until EOF:
 - Magic: `HMIMIDIP` at offset `0x00`
 - Track count: LE uint32 at `0x30`
 - Tempo: LE uint32 at `0x38`; time division = `tempo × 1.6`
-- Device track map: `[5][32]` LE uint32 array at `0x80` (5 devices × 32 track slots)
+- Device track map: nominally a `[5][32]` array near `0x80` (per-device track subsets),
+  but unpopulated in Descent's files — see "A note on per-device arrangements"
 - Track data: starts at `0x308`; each track preceded by a 12-byte header
 - Delta times: HMI little-endian VLQ (MSB-terminated, least-significant byte first — opposite of standard MIDI)
 - Tempo: `1,605,632 µs/beat` (~37.4 BPM), matching DXX-Rebirth's hardcoded SMF value
@@ -409,4 +387,3 @@ then, repeated until EOF:
 - HOG format from DXX-Rebirth utilities by Josh Cogliati and Bradley Bell (GPL v2+)
 - RetroWave wire protocol from [SudoMaker/RetroWave](https://github.com/SudoMaker/RetroWave)
   `RetroWaveLib/` (AGPLv3)
-- MT-32 SysEx structure from the Roland MT-32 MIDI Implementation manual

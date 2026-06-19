@@ -65,22 +65,11 @@ struct HmpTrack {
     uint32_t cur_time{0};   // track's current tick time
 };
 
-// HMI SOS device indices in deviceTrackMappings
-static constexpr int HMP_DEVICE_OPL  = 0;  // AdLib/OPL
-static constexpr int HMP_DEVICE_MT32 = 1;  // Roland MT-32
-static constexpr int HMP_DEVICE_GM   = 2;  // General MIDI
-static constexpr int HMP_DEVICE_GS   = 3;  // Roland GS
-static constexpr int HMP_DEVICE_TANDY= 4;  // Tandy
-static const char *HMP_DEVICE_NAMES[5] = {"OPL/AdLib","MT-32","GM","Roland GS","Tandy"};
-
 struct HmpFile {
     int num_tracks{0};
     int tempo{0};           // raw value from header; time_div = tempo * 1.6
     HmpTrack tracks[HMP_MAX_TRACKS];
     long filesize{0};
-    // deviceTrackMappings[device][slot]: track index to play per device (0=unused)
-    uint32_t device_track_map[5][32]{};
-    bool has_device_map{false};
 };
 
 // A decoded MIDI event ready for sequencer dispatch
@@ -460,8 +449,6 @@ struct PlayOptions {
     bool loop{false};
     double tempo_scale{1.0};
     bool verbose{false};
-    int  device{-1};        // HMP device index (-1 = auto/all tracks)
-    bool mt32_init{false};  // send MT-32 SysEx init before playback
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -542,65 +529,14 @@ void key_thread_fn(PlayOptions *opts) {
 
 
 // Wrapper that handles tempo change meta events properly
-// Roland MT-32 SysEx checksum: (128 - (sum_of_addr_and_data % 128)) % 128
-static std::vector<uint8_t> mt32_sysex(
-        std::initializer_list<uint8_t> addr,
-        std::initializer_list<uint8_t> data) {
-    std::vector<uint8_t> msg = {0xF0, 0x41, 0x10, 0x16, 0x12};
-    uint8_t sum = 0;
-    for (uint8_t b : addr) { msg.push_back(b); sum = (sum + b) & 0x7F; }
-    for (uint8_t b : data) { msg.push_back(b); sum = (sum + b) & 0x7F; }
-    msg.push_back((128 - sum) & 0x7F);  // checksum
-    msg.push_back(0xF7);
-    return msg;
-}
-
-// Send the standard MT-32 initialisation sequence:
-//   master volume, Hall reverb, and even partial reserve across 8 parts
-void mt32_init(AlsaSeq &alsa) {
-    printf("  Sending MT-32 SysEx init (volume, reverb, partial reserve)...\n");
-
-    // Master volume = 100  (address 10 00 16)
-    auto vol = mt32_sysex({0x10,0x00,0x16}, {100});
-    alsa.send_sysex(vol.data(), vol.size());
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Reverb: Hall, time=4, level=4  (address 10 00 01)
-    auto rev = mt32_sysex({0x10,0x00,0x01}, {0x01, 0x04, 0x04});
-    alsa.send_sysex(rev.data(), rev.size());
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Partial reserve: 4 per part for all 8 melody parts, 0 for rhythm
-    // Total must be <= 32  (address 10 00 04)
-    auto pr = mt32_sysex({0x10,0x00,0x04}, {4,4,4,4,4,4,4,4,0});
-    alsa.send_sysex(pr.data(), pr.size());
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    printf("  MT-32 init done.\n");
-}
-
 void play_hmp(AlsaSeq &alsa, const HmpFile &hmp, const PlayOptions &opts) {
-    // Build active-track set for this device (if device map is present)
+    // Play all music tracks for a General MIDI device (e.g. SC-55, or an MT-32pi
+    // in GM mode). Descent's per-device track map isn't usable from these files
+    // (the OPL/MT-32 subsets aren't cleanly encoded), and the .hmp arrangement
+    // doesn't fit a real MT-32's 9 parts — so we target GM, which voices every
+    // channel. The OPL3 route is handled by hmpplay_opl3.
+    (void)opts;
     std::vector<bool> track_active(hmp.num_tracks, true);
-    if (opts.device >= 0 && opts.device <= 4 && hmp.has_device_map) {
-        std::fill(track_active.begin(), track_active.end(), false);
-        int mapped = 0;
-        for (int slot = 0; slot < 32; slot++) {
-            uint32_t ti = hmp.device_track_map[opts.device][slot];
-            if (ti > 0 && (int)ti < hmp.num_tracks) {
-                track_active[ti] = true;
-                mapped++;
-            }
-        }
-        if (mapped == 0) {
-            printf("  Warning: no tracks mapped for device %d (%s), playing all\n",
-                   opts.device, HMP_DEVICE_NAMES[opts.device]);
-            std::fill(track_active.begin(), track_active.end(), true);
-        } else {
-            printf("  Device %d (%s): %d mapped tracks\n",
-                   opts.device, HMP_DEVICE_NAMES[opts.device], mapped);
-        }
-    }
     track_active[0] = false;  // track 0 is always the conductor track
 
     auto events = decode_hmp(hmp, track_active);
@@ -693,21 +629,20 @@ static void usage(const char *prog) {
         "  -l               Loop the file indefinitely (Ctrl-C to stop)\n"
         "  -t scale         Tempo multiplier (e.g. 0.5 = half speed, 2.0 = double)\n"
         "  -v               Verbose: print each MIDI event\n"
-        "  -D N             HMP device index for track selection:\n"
-        "                     0=OPL  1=MT-32  2=GM  3=Roland GS  4=Tandy\n"
-        "  --mt32           Shorthand for -D 1 + MT-32 SysEx init\n"
-        "  --gm             Shorthand for -D 2 (General MIDI tracks, no SysEx)\n"
         "  --list           List available ALSA MIDI output ports and exit\n"
         "  -h, --help       Show this help\n"
         "\n"
-        "MT-32 example (mt32pi in MT-32 mode):\n"
-        "  %s --mt32 -p 20:0 ./music/\n"
+        "Plays to a General MIDI device (e.g. Roland SC-55, or an MT-32pi in GM/\n"
+        "soundfont mode). For OPL3 FM hardware use hmpplay_opl3 instead.\n"
+        "Note: native MT-32 mode is not supported — Descent's .hmp files carry the\n"
+        "dense OPL arrangement (13-16 channels), which a real MT-32 (9 parts) can't\n"
+        "voice; use GM mode, which plays every channel.\n"
         "\n"
-        "GM example (mt32pi in GM/soundfont mode):\n"
-        "  %s --gm  -p 20:0 ./music/\n"
+        "Example (mt32pi/SC-55 in GM mode):\n"
+        "  %s -p 20:0 ./music/\n"
         "\n"
         "Build:  g++ -std=c++17 -O2 -o hmpplay hmpplay.cpp -lasound\n",
-        prog, prog, prog);
+        prog, prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -727,15 +662,8 @@ int main(int argc, char *argv[]) {
             opts.loop = true;
         } else if (!strcmp(argv[i], "-v")) {
             opts.verbose = true;
-        } else if (!strcmp(argv[i], "-D") && i + 1 < argc) {
-            opts.device = atoi(argv[++i]);
-            if (opts.device < 0 || opts.device > 4) {
-                fprintf(stderr, "Error: device index must be 0-4\n"); return 1; }
-        } else if (!strcmp(argv[i], "--mt32")) {
-            opts.device = HMP_DEVICE_MT32;
-            opts.mt32_init = true;
         } else if (!strcmp(argv[i], "--gm")) {
-            opts.device = HMP_DEVICE_GM;
+            // Accepted for backward compatibility; GM is the only/default mode.
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
