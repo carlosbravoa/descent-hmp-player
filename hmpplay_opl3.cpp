@@ -13,14 +13,19 @@
  *             →  adl_switchSerialHW() (RetroWave OPL3 serial chip)
  *             →  /dev/ttyACM0 @ 2 Mbaud
  *
- * Built-in Descent banks (no .bnk files needed):
+ * Instrument banks:
+ *   By default the bank is chosen PER SONG from descent.sng (Descent's own
+ *   song→bank list), mapping each song's melodic .bnk to the matching built-in
+ *   Descent bank. This is what makes a mixed soundtrack folder sound right —
+ *   game12 wants melodic, the intro wants ham, etc. Pass --bank/-b to override
+ *   and force one bank for everything.
+ *
  *   --bank int   →  "HMI (Descent:: Int)" — intmelo/intdrum (OPL/AdLib)
  *   --bank ham   →  "HMI (Descent:: Ham)" — hammelo/hamdrum
  *   --bank rick  →  "HMI (Descent:: Rick)"
  *   --bank d2    →  "HMI (Descent 2)"
  *   --bank gm    →  "HMI (Descent, Asterix)" — melodic/drum (GM-ish)
- * Or load external bank files:
- *   -b /path/to/intmelo.bnk  (AdLib BNK format)
+ *   -b file.wopl →  load an external WOPL bank file
  *
  * Build: see build.sh
  *
@@ -38,8 +43,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <dirent.h>
+#include <map>
 #include <memory>
 #include <poll.h>
 #include <signal.h>
@@ -276,8 +283,10 @@ struct PlayOptions {
     double      tempo_scale{1.0};
     bool        verbose{false};
     int         device{HMP_DEVICE_OPL};
-    int         bank_no{6};          // built-in: 6 = HMI Descent Int
-    std::string bank_file;           // external .bnk (overrides bank_no)
+    int         bank_no{-1};         // built-in fallback; resolved to Int by name
+    bool        explicit_bank{false};// user forced a bank → disable per-song auto
+    bool        force_hmp{false};    // --hmp: force OPL2 .hmp even when .hmq exists
+    std::string bank_file;           // external .wopl (overrides bank_no)
     std::string serial_dev{"ttyACM0"};
 };
 
@@ -444,219 +453,98 @@ static std::vector<std::string> expand_args(const std::vector<const char *> &arg
     return result;
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
-// HMI AdLib BNK parser and BNK → WOPL in-memory converter
+// Per-song instrument bank selection (descent.sng)
+// ─────────────────────────────────────────────────────────────────────────────
 //
-// Loads intmelo.bnk (melodic) + intdrum.bnk (percussion) and builds a
-// WOPLFile in memory that adl_openBankData() can consume directly.
-// This gives libADLMIDI the actual original FM patches from the game.
-// ─────────────────────────────────────────────────────────────────────────────
+// Descent ships descent.sng: a tab-separated list  <song.hmp> <melodic.bnk>
+// <drum.bnk>  pairing every song with the instrument bank it was authored for.
+// Each of the four melodic banks has an exact counterpart already embedded in
+// libADLMIDI's bank DB (Wohlstand extracted them from these very .bnk files),
+// so we honor the per-song mapping without shipping any bank data:
+//
+//   melodic.bnk  -> #4  "HMI (Descent, Asterix)"   (GM-complete)
+//   intmelo.bnk  -> #6  "HMI (Descent:: Int)"
+//   hammelo.bnk  -> #8  "HMI (Descent:: Ham)"
+//   rickmelo.bnk -> #10 "HMI (Descent:: Rick)"
+//
+// DXX-Rebirth and the stock libADLMIDI path ignore these columns and use ONE
+// bank for the whole soundtrack — the main reason mixed folders sound off.
 
-// One operator's worth of BNK data (13 bytes per op in the PackedTimbre)
-struct BnkOp {
-    uint8_t ksl, multiple, feedback, attack, sustain, eg, decay, rel;
-    uint8_t totalLevel, am, vib, ksr, con;
-};
+static std::string lower_str(std::string s) {
+    for (auto &c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
 
-struct BnkInst {
-    bool     valid{false};
-    bool     percussive{false};
-    uint8_t  voice_num{0};   // percussion MIDI note
-    BnkOp    op[2];          // op[0]=modulator, op[1]=carrier
-    uint8_t  mod_wave{0}, car_wave{0};
-};
+// Basename without directory or extension, lowercased:  a/b/GAME01.hmp -> game01
+static std::string song_key(const std::string &path) {
+    size_t slash = path.find_last_of('/');
+    std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos) base = base.substr(0, dot);
+    return lower_str(base);
+}
 
-// Parse one HMI .bnk file into a vector of 128 instruments.
-static std::vector<BnkInst> load_bnk_file(const char *path) {
-    std::vector<BnkInst> bank(128);
-    FILE *f = fopen(path, "rb");
-    if (!f) return bank; // returns all-invalid on failure
+static std::string dir_of(const std::string &path) {
+    size_t slash = path.find_last_of('/');
+    return (slash == std::string::npos) ? std::string() : path.substr(0, slash);
+}
 
-    uint8_t hdr[24];
-    if (fread(hdr, 1, 24, f) != 24 || memcmp(hdr+2, "ADLIB-", 6) != 0) {
-        fclose(f); return bank;
-    }
-    uint16_t num_used   = hdr[8]  | (hdr[9]  << 8);
-    uint32_t offset_name = hdr[12] | (hdr[13]<<8) | (hdr[14]<<16) | (hdr[15]<<24);
-    uint32_t offset_data = hdr[16] | (hdr[17]<<8) | (hdr[18]<<16) | (hdr[19]<<24);
+// Resolve a built-in bank index by a distinctive substring of its name. The
+// bank id passed to adl_setBank() is the ORDINAL position in adl_getBankNames()
+// — NOT the data-offset numbers in inst_db.cpp. Looking it up by name avoids
+// the off-by-data-offset bug that had --bank int actually loading Descent 2.
+static int find_bank(const char *needle) {
+    const char *const *names = adl_getBankNames();
+    int n = adl_getBanksCount();
+    for (int i = 0; i < n; i++)
+        if (names[i] && strstr(names[i], needle)) return i;
+    return -1;
+}
 
-    fseek(f, offset_name, SEEK_SET);
-    for (int i = 0; i < (int)num_used; i++) {
-        uint8_t ne[12];
-        if (fread(ne, 1, 12, f) != 12) break;
-        uint16_t data_idx = ne[0] | (ne[1] << 8);
-        if (data_idx >= 128) continue;
+static int bank_no_for_melo(const std::string &melo) {
+    std::string n = lower_str(melo);
+    if (n.find("intmelo")  != std::string::npos) return find_bank("Descent:: Int");
+    if (n.find("hammelo")  != std::string::npos) return find_bank("Descent:: Ham");
+    if (n.find("rickmelo") != std::string::npos) return find_bank("Descent:: Rick");
+    if (n.find("melodic")  != std::string::npos) return find_bank("Descent, Asterix");
+    return -1;
+}
 
-        long saved = ftell(f);
-        fseek(f, offset_data + data_idx * 30, SEEK_SET);
-        uint8_t d[30];
-        if (fread(d, 1, 30, f) != 30) { fseek(f, saved, SEEK_SET); continue; }
-        fseek(f, saved, SEEK_SET);
-
-        BnkInst &ins = bank[data_idx];
-        ins.valid      = true;
-        ins.percussive = d[0] != 0;
-        ins.voice_num  = d[1];
-        for (int op = 0; op < 2; op++) {
-            const uint8_t *b = d + 2 + op * 13;
-            ins.op[op] = {b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12]};
-        }
-        ins.mod_wave = d[28];
-        ins.car_wave = d[29];
+// Load descent.sng from `dir` into  song_key -> built-in bank number.
+static std::map<std::string,int> load_song_banks(const std::string &dir) {
+    std::map<std::string,int> m;
+    std::string path = (dir.empty() ? std::string(".") : dir) + "/descent.sng";
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return m;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char song[128] = {0}, melo[128] = {0};
+        // %s stops at any whitespace incl. tab and the DOS CR — no \r cleanup needed
+        if (sscanf(line, "%127s %127s", song, melo) < 2) continue;
+        int bn = bank_no_for_melo(melo);
+        if (bn >= 0) m[song_key(song)] = bn;
     }
     fclose(f);
-    return bank;
+    return m;
 }
 
-// Build a WOPL v2 binary blob from melodic + percussion BnkInst vectors.
-// Layout verified against libADLMIDI src/wopl/wopl_file.c WOPL_parseInstrument().
-// Returns raw bytes for adl_openBankData(), or empty on failure.
-static std::vector<uint8_t> bnk_pair_to_wopl(
-        const std::vector<BnkInst> &mel,
-        const std::vector<BnkInst> &drm) {
-
-    // WOPL uses big-endian for most multi-byte fields (note offsets, bank counts).
-    // Version field and total inst size are little-endian.
-    auto wbe16 = [](std::vector<uint8_t> &b, int16_t v) {
-        b.push_back((v >> 8) & 0xFF); b.push_back(v & 0xFF);
-    };
-    auto wle16 = [](std::vector<uint8_t> &b, uint16_t v) {
-        b.push_back(v & 0xFF); b.push_back((v >> 8) & 0xFF);
-    };
-    auto wbyte = [](std::vector<uint8_t> &b, uint8_t v) { b.push_back(v); };
-    auto wpad  = [](std::vector<uint8_t> &b, int n)  { b.insert(b.end(), n, 0); };
-    auto wstr  = [](std::vector<uint8_t> &b, const char *s, int len) {
-        int sl = s ? (int)strlen(s) : 0;
-        for (int i = 0; i < len; i++) b.push_back(i < sl ? (uint8_t)s[i] : 0);
-    };
-
-    // Write one 5-byte operator block (offsets 42+l*5 in v2 instrument)
-    auto write_op = [&](std::vector<uint8_t> &b, const BnkOp &op, uint8_t wave) {
-        wbyte(b, (op.am?0x80:0)|(op.vib?0x40:0)|(op.eg?0x20:0)|(op.ksr?0x10:0)|(op.multiple&0x0F));
-        wbyte(b, (op.ksl<<6)|(op.totalLevel&0x3F));
-        wbyte(b, (op.attack<<4)|(op.decay&0x0F));
-        wbyte(b, (op.sustain<<4)|(op.rel&0x0F));
-        wbyte(b, wave & 0x07);
-    };
-
-    // Write one 62-byte v2 instrument block.
-    // Exact layout from WOPL_parseInstrument() in wopl_file.c:
-    //   [0..31]  inst_name (32 bytes, then  )         — we write 32 chars
-    //   [32]     inst_name[32] = ' ' added by parser   — we write it
-    //   [32..33] note_offset1  sint16 BE
-    //   [34..35] note_offset2  sint16 BE
-    //   [36]     midi_velocity_offset
-    //   [37]     second_voice_detune
-    //   [38]     percussion_key_number
-    //   [39]     inst_flags  (0x08 = blank)
-    //   [40]     fb_conn1_C0
-    //   [41]     fb_conn2_C0
-    //   [42..46] operator 0 (5 bytes)
-    //   [47..51] operator 1 (5 bytes)
-    //   [52..56] operator 2 (5 bytes, zeros for 2-op)
-    //   [57..61] operator 3 (5 bytes, zeros for 2-op)
-    //   Total = 62 bytes = WOPL_INST_SIZE_V2
-    auto write_inst = [&](std::vector<uint8_t> &b, const BnkInst &ins, int prog) {
-        char name[33]{}; snprintf(name, 33, "ins_%03d", prog);
-        wstr(b, name, 32);          // [0..31]
-        wbyte(b, 0);                // [32] null terminator part of name field
-        wbe16(b, 0);                // [33..34] note_offset1
-        wbe16(b, 0);                // [35..36] note_offset2  (note: parser reads 32,34)
-        // ^^^ The parser reads note_offset1 at cursor+32, note_offset2 at cursor+34,
-        //     but the name is 32 bytes NOT including the null — parser adds null manually.
-        //     So inst_name is bytes [0..31] (32 bytes), null at [32], then offsets at [32..35].
-        //     Wait — strncpy(name, cursor, 32) then name[32]=' ' means the stored name
-        //     is bytes [0..31] and the null is NOT in the binary. Then note_offset1 is
-        //     at cursor+32. So no null byte between name and offsets. Let me fix:
-        // Actually re-read: strncpy copies 32 bytes from cursor[0], sets cursor[32]=0 in
-        // the struct but doesn't advance cursor. note_offset1 = toSint16BE(cursor+32).
-        // So bytes [0..31]=name, [32..33]=note_offset1 BE, [34..35]=note_offset2 BE.
-        // We wrote one too many bytes above. Let me redo:
-        b.resize(b.size() - 3); // undo the 0 + wbe16(0)
-        wbe16(b, 0);                // [32..33] note_offset1 BE
-        wbe16(b, 0);                // [34..35] note_offset2 BE
-        wbyte(b, 0);                // [36] midi_velocity_offset
-        wbyte(b, 0);                // [37] second_voice_detune
-        wbyte(b, ins.valid && ins.percussive ? ins.voice_num : 0); // [38]
-        wbyte(b, ins.valid ? 0x00 : 0x08); // [39] inst_flags (0x08=blank)
-        // fb_conn1_C0 [40]: connection(bit0) | feedback(bits1-3) | OPL3-enable(bits4-5=0x30)
-        // BNK 'con' field: 0=FM(carrier output) meaning OPL con bit=1 (additive=off)
-        //                  non-zero=additive meaning OPL con bit=0
-        uint8_t con_bit = (ins.valid && ins.op[0].con == 0) ? 1 : 0;
-        uint8_t fb      = ins.valid ? (uint8_t)((ins.op[0].feedback & 0x07) << 1) : 0;
-        wbyte(b, fb | con_bit | 0x30); // [40] fb_conn1_C0
-        wbyte(b, 0x30);            // [41] fb_conn2_C0 (4-op only)
-        if (ins.valid) {
-            write_op(b, ins.op[0], ins.mod_wave); // [42..46]
-            write_op(b, ins.op[1], ins.car_wave); // [47..51]
-        } else {
-            wpad(b, 10);           // [42..51] silence
-        }
-        wpad(b, 10);               // [52..61] ops 2,3 (zeros for 2-op)
-        // Total so far: 32 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 10 + 10 = 62 ✓
-    };
-
-    // Bank header v2: 32-byte name + lsb(1) + msb(1) = 34 bytes
-    auto write_bank_hdr = [&](std::vector<uint8_t> &b, const char *name) {
-        wstr(b, name, 32);
-        wbyte(b, 0); // lsb
-        wbyte(b, 0); // msb
-    };
-
-    std::vector<uint8_t> out;
-
-    // File header:
-    //  [0..10]  magic "WOPL3-BANK " (11 bytes)
-    //  [11..12] version uint16 LE = 2
-    //  [13..14] banks_melodic uint16 BE
-    //  [15..16] banks_percussion uint16 BE
-    //  [17]     opl_flags
-    //  [18]     volume_model
-    const char *magic = "WOPL3-BANK";
-    out.insert(out.end(), magic, magic + 11); // includes  
-    wle16(out, 2);      // version 2 (LE)
-    // bank counts are big-endian (parsed with toUint16BE in wopl_file.c)
-    out.push_back(0); out.push_back(1); // banks_melodic = 1 (BE)
-    out.push_back(0); out.push_back(1); // banks_percussion = 1 (BE)
-    wbyte(out, 0x03);   // opl_flags: deep tremolo + deep vibrato
-    wbyte(out, 0x0A);   // volume_model: HMI = 10
-
-    // Bank names (v2 only: melodic banks first, then percussion)
-    write_bank_hdr(out, "Descent Int Melodic");
-    write_bank_hdr(out, "Descent Int Drums");
-
-    // Instruments: all melodic banks, then all percussion banks
-    for (int i = 0; i < 128; i++)
-        write_inst(out, i < (int)mel.size() ? mel[i] : BnkInst{}, i);
-    for (int i = 0; i < 128; i++)
-        write_inst(out, i < (int)drm.size() ? drm[i] : BnkInst{}, i);
-
-    return out;
+// Prefer the OPL3 (.hmq) arrangement when present — this is what Descent itself
+// loads on an OPL3 sound card (the RetroWave is one). It's a genuinely different,
+// richer arrangement than the OPL2 .hmp: more tracks, and channel 9 is real GM
+// percussion (matching libADLMIDI's default), whereas .hmp puts a melodic voice
+// on ch9 that libADLMIDI would wrongly render as drums. Same per-song bank either
+// way. Use --hmp to force the OPL2 .hmp instead.
+static std::string prefer_hmq(const std::string &path) {
+    size_t dot = path.find_last_of('.');
+    if (dot != std::string::npos && lower_str(path.substr(dot)) == ".hmp") {
+        std::string hmq = path.substr(0, dot) + ".hmq";
+        struct stat st;
+        if (stat(hmq.c_str(), &st) == 0) return hmq;
+    }
+    return path;
 }
 
-// Look for intmelo.bnk + intdrum.bnk next to the given path (file or dir).
-// Returns the directory to search, or empty string if not found.
-static std::string find_bnk_dir(const std::string &hmp_path) {
-    // Try the directory containing the HMP file
-    std::string dir = hmp_path;
-    auto slash = dir.rfind('/');
-    if (slash != std::string::npos)
-        dir = dir.substr(0, slash);
-    else
-        dir = ".";
-
-    auto exists = [](const std::string &p) {
-        struct stat st; return stat(p.c_str(), &st) == 0;
-    };
-
-    if (exists(dir + "/intmelo.bnk") && exists(dir + "/intdrum.bnk"))
-        return dir;
-    // Also try current directory
-    if (exists("./intmelo.bnk") && exists("./intdrum.bnk"))
-        return ".";
-    return "";
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // main
@@ -668,27 +556,33 @@ static void usage(const char *prog) {
         "\n"
         "Options:\n"
         "  -d name          Serial device name without /dev/ (default: ttyACM0)\n"
-        "  -m intmelo.bnk   Melodic HMI BNK file (auto-detected if next to HMP)\n"
-        "  -r intdrum.bnk   Percussion HMI BNK file (auto-detected if next to HMP)\n"
-        "  -b file.wopl     Load WOPL format bank file\n"
-        "  --bank NAME      Built-in bank fallback if no BNK files found:\n"
-        "                     int   HMI (Descent Int)   [default, OPL/AdLib]\n"
+        "  -b file.wopl     Force a custom WOPL bank for every song\n"
+        "  --bank NAME      Force one built-in bank for every song (overrides\n"
+        "                   the per-song default; useful for A/B testing):\n"
+        "                     int   HMI (Descent Int)   [OPL/AdLib]\n"
         "                     ham   HMI (Descent Ham)\n"
         "                     rick  HMI (Descent Rick)\n"
         "                     d2    HMI (Descent 2)\n"
         "                     gm    HMI (Descent, Asterix)  [GM-ish]\n"
         "  -D N             HMP device track selection (default: 0=OPL)\n"
         "                     0=OPL  1=MT-32  2=GM  3=Roland GS\n"
+        "  --hmp            Force the OPL2 .hmp arrangement even when a richer\n"
+        "                     .hmq (OPL3) version exists. By default .hmq is\n"
+        "                     preferred — that's what Descent loads on OPL3.\n"
         "  -l               Loop playlist indefinitely\n"
         "  -t scale         Tempo multiplier (default: 1.0)\n"
         "  -v               Verbose\n"
         "  -h, --help       This help\n"
         "\n"
+        "By default each song's bank is chosen from descent.sng (must be in the\n"
+        "same folder as the songs), and the .hmq (OPL3) arrangement is preferred\n"
+        "over .hmp when present — as Descent does on an OPL3 card.\n"
+        "\n"
         "Examples:\n"
-        "  %s ./music/\n"
-        "  %s -l ./music/                        # auto-detects intmelo/intdrum.bnk\n"
-        "  %s --bank d2 ./music/                 # use built-in Descent 2 bank\n"
-        "  %s -m ./banks/intmelo.bnk -r ./banks/intdrum.bnk ./music/\n"
+        "  %s ./music/                           # per-song banks from descent.sng\n"
+        "  %s -l ./music/                        # loop the whole soundtrack\n"
+        "  %s --bank d2 ./music/                 # force the Descent 2 bank\n"
+        "  %s -b mybank.wopl ./music/            # force a custom WOPL bank\n"
         "\n"
         "Build: see build.sh\n",
         prog, prog, prog, prog, prog);
@@ -700,31 +594,30 @@ int main(int argc, char *argv[]) {
 
     PlayOptions opts;
     std::vector<const char *> raw_files;
-    const char *mel_path = nullptr; // explicit -m melodic.bnk
-    const char *drm_path = nullptr; // explicit -r drums.bnk
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-d") && i+1 < argc) {
             opts.serial_dev = argv[++i];
         } else if (!strcmp(argv[i], "--bank") && i+1 < argc) {
             const char *n = argv[++i];
-            if      (!strcmp(n,"int"))  opts.bank_no = 6;
-            else if (!strcmp(n,"ham"))  opts.bank_no = 8;
-            else if (!strcmp(n,"rick")) opts.bank_no = 10;
-            else if (!strcmp(n,"d2"))   opts.bank_no = 12;
-            else if (!strcmp(n,"gm"))   opts.bank_no = 4;
+            if      (!strcmp(n,"int"))  opts.bank_no = find_bank("Descent:: Int");
+            else if (!strcmp(n,"ham"))  opts.bank_no = find_bank("Descent:: Ham");
+            else if (!strcmp(n,"rick")) opts.bank_no = find_bank("Descent:: Rick");
+            else if (!strcmp(n,"d2"))   opts.bank_no = find_bank("Descent 2");
+            else if (!strcmp(n,"gm"))   opts.bank_no = find_bank("Descent, Asterix");
             else { fprintf(stderr,"Unknown bank '%s'\n",n); return 1; }
+            if (opts.bank_no < 0) { fprintf(stderr,"Bank '%s' not in this libADLMIDI build\n",n); return 1; }
+            opts.explicit_bank = true;   // force this bank for every song
         } else if (!strcmp(argv[i], "-b") && i+1 < argc) {
             opts.bank_file = argv[++i];
-        } else if (!strcmp(argv[i], "-m") && i+1 < argc) {
-            mel_path = argv[++i];
-        } else if (!strcmp(argv[i], "-r") && i+1 < argc) {
-            drm_path = argv[++i];
+            opts.explicit_bank = true;
         } else if (!strcmp(argv[i], "-D") && i+1 < argc) {
             opts.device = atoi(argv[++i]);
             if (opts.device < 0 || opts.device > 4) {
                 fprintf(stderr,"Device must be 0-4\n"); return 1;
             }
+        } else if (!strcmp(argv[i], "--hmp")) {
+            opts.force_hmp = true;
         } else if (!strcmp(argv[i], "-l")) {
             opts.loop = true;
         } else if (!strcmp(argv[i], "-v")) {
@@ -746,83 +639,45 @@ int main(int argc, char *argv[]) {
     auto files = expand_args(raw_files);
     if (files.empty()) { fprintf(stderr,"Error: no .hmp files\n"); return 1; }
 
+    // Fallback bank (songs with no descent.sng match) = Descent Int.
+    if (opts.bank_no < 0) opts.bank_no = find_bank("Descent:: Int");
+    if (opts.bank_no < 0) opts.bank_no = 0; // last resort if names ever change
+
     // ── Init libADLMIDI ───────────────────────────────────────────────────────
     ADL_MIDIPlayer *adl = adl_init(49716); // native OPL sample rate
     if (!adl) { fprintf(stderr,"adl_init failed\n"); return 1; }
     g_adl = adl;
 
-    // ── Instrument bank loading ───────────────────────────────────────────────
-    // Priority:
-    //   1. Explicit -m melodic.bnk + -r drums.bnk  (raw HMI BNK files)
-    //   2. Explicit -b file.wopl                    (WOPL format)
-    //   3. BNK files auto-detected next to HMP files
-    //   4. Built-in embedded bank (--bank flag)
-    bool bank_loaded = false;
-
-    // Helper: load BNK pair and feed to libADLMIDI
-    auto load_bnk_pair = [&](const char *mel, const char *drm) -> bool {
-        auto melodic  = load_bnk_file(mel);
-        auto drums    = load_bnk_file(drm);
-        bool mel_ok   = std::any_of(melodic.begin(), melodic.end(),
-                                    [](const BnkInst &b){ return b.valid; });
-        bool drm_ok   = std::any_of(drums.begin(),   drums.end(),
-                                    [](const BnkInst &b){ return b.valid; });
-        if (!mel_ok && !drm_ok) return false;
-        auto wopl = bnk_pair_to_wopl(melodic, drums);
-        if (wopl.empty()) return false;
-        if (adl_openBankData(adl, wopl.data(), (unsigned long)wopl.size()) != 0) {
-            fprintf(stderr, "BNK load error: %s\n", adl_errorInfo(adl));
-            return false;
-        }
-        printf("Bank: %s + %s\n", mel, drm);
-        return true;
-    };
-
-    if (mel_path || drm_path) {
-        // Explicit BNK files given
-        const char *m = mel_path ? mel_path : "";
-        const char *d = drm_path ? drm_path : "";
-        if (!load_bnk_pair(m, d)) {
-            fprintf(stderr, "Error loading BNK files\n");
-            adl_close(adl); return 1;
-        }
-        bank_loaded = true;
-    }
-
-    if (!bank_loaded && !opts.bank_file.empty()) {
-        // Explicit WOPL file
+    // ── Instrument bank ───────────────────────────────────────────────────────
+    // Use libADLMIDI's built-in, properly-tuned Descent banks. These embed the
+    // correct HMI volume model (VOLUME_MODEL=9), deep tremolo/vibrato, and the
+    // instrument data the libADLMIDI author tuned against the real game — the
+    // same data chip-player-js and DXX-Rebirth use. A custom .wopl can override.
+    if (!opts.bank_file.empty()) {
         if (adl_openBankFile(adl, opts.bank_file.c_str()) != 0) {
             fprintf(stderr, "Bank file error: %s\n", adl_errorInfo(adl));
             adl_close(adl); return 1;
         }
         printf("Bank: %s\n", opts.bank_file.c_str());
-        bank_loaded = true;
-    }
-
-    if (!bank_loaded && !files.empty()) {
-        // Auto-detect intmelo.bnk + intdrum.bnk next to the first HMP file
-        std::string bnk_dir = find_bnk_dir(files[0]);
-        if (!bnk_dir.empty()) {
-            std::string m = bnk_dir + "/intmelo.bnk";
-            std::string d = bnk_dir + "/intdrum.bnk";
-            if (load_bnk_pair(m.c_str(), d.c_str()))
-                bank_loaded = true;
-        }
-    }
-
-    if (!bank_loaded) {
-        // Fall back to built-in embedded bank
+    } else {
         if (adl_setBank(adl, opts.bank_no) != 0) {
             fprintf(stderr, "Bank %d error: %s\n", opts.bank_no, adl_errorInfo(adl));
             adl_close(adl); return 1;
         }
-        printf("Bank: built-in #%d — %s\n", opts.bank_no, adl_getBankNames()[opts.bank_no]);
+        if (opts.explicit_bank)
+            printf("Bank: built-in #%d — %s  (forced for all songs)\n",
+                   opts.bank_no, adl_getBankNames()[opts.bank_no]);
+        else
+            printf("Bank: per-song from descent.sng "
+                   "(fallback #%d — %s)\n",
+                   opts.bank_no, adl_getBankNames()[opts.bank_no]);
     }
 
-    // HMI volume model: essential for correct Descent dynamics
-    adl_setVolumeRangeModel(adl, ADLMIDI_VolumeModel_HMI);
+    // Volume model: AUTO honors the bank's own VOLUME_MODEL (HMI for Descent),
+    // which is the fix for the "notes sustain too long" symptom (libADLMIDI #223).
+    adl_setVolumeRangeModel(adl, ADLMIDI_VolumeModel_AUTO);
 
-    // One OPL3 chip (18 two-operator voices)
+        // One OPL3 chip (18 two-operator voices)
     adl_setNumChips(adl, 1);
 
     // Connect to RetroWave OPL3 Express
@@ -843,12 +698,37 @@ int main(int argc, char *argv[]) {
     std::thread key_thread(key_thread_fn_real, &opts);
 
     // ── Play loop ─────────────────────────────────────────────────────────────
+    // Per-song banks come from descent.sng (unless --bank/-b forced one). Cache
+    // the parsed list per directory; track the live bank to avoid redundant
+    // adl_setBank() calls.
+    const bool auto_bank = !opts.explicit_bank && opts.bank_file.empty();
+    std::map<std::string, std::map<std::string,int>> sng_cache;
+    int cur_bank = opts.bank_no;
+
     int idx = 0;
     while (!g_stop && idx < (int)files.size()) {
-        printf("\n[%d/%d] %s\n", idx+1, (int)files.size(), files[idx].c_str());
+        std::string playpath = opts.force_hmp ? files[idx] : prefer_hmq(files[idx]);
+        printf("\n[%d/%d] %s\n", idx+1, (int)files.size(), playpath.c_str());
+
+        if (auto_bank) {
+            std::string d = dir_of(files[idx]);
+            auto it = sng_cache.find(d);
+            if (it == sng_cache.end())
+                it = sng_cache.emplace(d, load_song_banks(d)).first;
+            auto bit = it->second.find(song_key(files[idx]));
+            int bn = (bit != it->second.end()) ? bit->second : opts.bank_no;
+            printf("  Bank: #%d — %s%s\n", bn, adl_getBankNames()[bn],
+                   (bit == it->second.end()) ? "  (no descent.sng match — fallback)" : "");
+            fflush(stdout);
+            if (bn != cur_bank && adl_setBank(adl, bn) == 0) {
+                adl_setVolumeRangeModel(adl, ADLMIDI_VolumeModel_AUTO);
+                adl_setNumChips(adl, 1);
+                cur_bank = bn;
+            }
+        }
 
         HmpFile *hmp = nullptr;
-        try { hmp = hmp_open(files[idx].c_str()); }
+        try { hmp = hmp_open(playpath.c_str()); }
         catch (const std::exception &e) {
             fprintf(stderr,"  Error: %s\n", e.what()); idx++; continue;
         }

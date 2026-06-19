@@ -6,8 +6,9 @@ synthesis — just the game's music on the devices it was designed for.
 
 Aimed at two targets:
 
-- **RetroWave OPL3 Express** — direct USB serial playback using Descent's own FM
-  instrument banks, exactly as it sounded on a real Sound Blaster
+- **RetroWave OPL3 Express** — direct USB serial playback on real OPL3 hardware, with
+  the **correct instrument bank chosen automatically per song** (Descent uses four
+  different FM banks across its soundtrack), exactly as it sounded on a real Sound Blaster
 - **Roland MT-32 / MT-32pi** — native MT-32 mode with proper track selection and SysEx
   init, or GM/soundfont mode for a modern take
 
@@ -21,7 +22,7 @@ needed to pull the music and instrument banks out of the game files.
 | Tool | What it does |
 |---|---|
 | `hmpplay` | Plays `.hmp` files to any ALSA MIDI port (MT-32, GM, Roland GS, …) |
-| `hmpplay_opl3` | Plays `.hmp` files directly to a RetroWave OPL3 Express via USB serial |
+| `hmpplay_opl3` | Plays `.hmp` files directly to a RetroWave OPL3 Express via USB serial, with automatic per-song instrument banks |
 | `hogtool` | Lists, extracts, and creates Descent `.hog` archives |
 
 ---
@@ -30,7 +31,7 @@ needed to pull the music and instrument banks out of the game files.
 
 | Device | Tool | Notes |
 |---|---|---|
-| RetroWave OPL3 Express | `hmpplay_opl3` | Direct OPL3 FM synthesis using Descent's own `intmelo.bnk` / `intdrum.bnk` patches |
+| RetroWave OPL3 Express | `hmpplay_opl3` | Direct OPL3 FM synthesis via libADLMIDI, auto-selecting each song's authored Descent bank (Int / Ham / Rick / Asterix) |
 | Roland MT-32pi (MT-32 mode) | `hmpplay --mt32` | Native MT-32 playback with SysEx init — closest to the original DOS experience |
 | Roland MT-32pi (GM mode) | `hmpplay --gm` | GM/soundfont playback — sounds great, slightly less authentic |
 | RetroWave OPL3 Express | `hmpplay` + [RetroWave MIDI Proxy](https://github.com/SudoMaker/RetroWaveMIDIProxy) | OPL3 via ALSA MIDI — simpler setup but uses proxy's own sound banks |
@@ -41,8 +42,13 @@ needed to pull the music and instrument banks out of the game files.
 
 ```bash
 sudo apt install libasound2-dev   # hmpplay only
-# hmpplay_opl3 and hogtool need nothing beyond libc/libc++
+sudo apt install cmake             # hmpplay_opl3 (builds the bundled libADLMIDI)
+# hogtool needs nothing beyond libc
 ```
+
+`hmpplay_opl3` is built by `./build.sh`, which compiles the bundled `libADLMIDI/`
+(patched for the RetroWave's 2 Mbaud serial rate) and then the player. Use
+`./build.sh fast` to rebuild just the player after editing it.
 
 ---
 
@@ -50,17 +56,16 @@ sudo apt install libasound2-dev   # hmpplay only
 
 ### 1. Extract the game files
 
-All music and instrument banks are packed inside the game's `.hog` archive:
+The music, instrument banks, and the `descent.sng` song list are all packed inside the
+game's `.hog` archive. Extract everything into one folder so `hmpplay_opl3` can find the
+per-song bank list:
 
 ```bash
 # Build hogtool
 gcc -O2 -o hogtool hogtool.c
 
-# Extract music files
+# Extract everything (songs + .bnk banks + descent.sng) into ./music/
 ./hogtool extract descent.hog -o ./music/
-
-# Extract OPL3 instrument banks (needed for hmpplay_opl3)
-./hogtool extract descent.hog -o ./banks/ intmelo.bnk intdrum.bnk
 ```
 
 ### 2. Play
@@ -73,9 +78,9 @@ g++ -std=c++17 -O2 -o hmpplay hmpplay.cpp -lasound
 # MT-32pi in GM mode
 ./hmpplay --gm -p 20:0 ./music/
 
-# RetroWave OPL3 Express (direct)
-g++ -std=c++17 -O2 -o hmpplay_opl3 hmpplay_opl3.cpp
-./hmpplay_opl3 -m ./banks/intmelo.bnk -r ./banks/intdrum.bnk ./music/
+# RetroWave OPL3 Express (direct) — bank auto-selected per song from descent.sng
+./build.sh
+./hmpplay_opl3 ./music/
 ```
 
 ---
@@ -226,54 +231,88 @@ sound, use `hmpplay_opl3` instead.
 ## hmpplay_opl3
 
 Plays `.hmp` files directly to a RetroWave OPL3 Express over USB serial (`/dev/ttyACM0`),
-using Descent's own FM instrument banks extracted from the game HOG. No MIDI proxy, no
-ALSA — register writes go straight to the YMF262 chip at 2 Mbaud.
+driving the real YMF262 chip at 2 Mbaud. No MIDI proxy, no ALSA — OPL register writes go
+straight to the hardware. FM synthesis is handled by [libADLMIDI](https://github.com/Wohlstand/libADLMIDI),
+whose built-in **Descent banks** carry the game's own FM patches.
 
-This is the most authentic OPL3 playback possible: the exact FM patches the game used on
-a real Sound Blaster, driven by the game's own music data.
+### The per-song bank — why this sounds right
+
+Descent's soundtrack isn't one instrument set. The game ships **four** FM bank pairs and
+assigns each song to one of them in `descent.sng` (its own song→bank list). The intro
+uses the *Ham* bank, level 12 uses the *Asterix/melodic* bank, and so on. Play every song
+through a single bank — as most OPL players do — and most of the soundtrack comes out on
+the wrong instruments.
+
+`hmpplay_opl3` reads `descent.sng` and switches to each song's authored bank
+automatically. Just point it at the folder you extracted the HOG into:
+
+```bash
+./hmpplay_opl3 ./music/
+```
+
+Each track prints the bank it picked, e.g. `Bank: #4 — HMI (Descent:: Ham)`. The four
+banks and how the songs split across them:
+
+| `descent.sng` melodic bank | libADLMIDI built-in bank | Songs |
+|---|---|---|
+| `melodic.bnk` | HMI (Descent, Asterix) | 14 |
+| `intmelo.bnk` | HMI (Descent:: Int)    | 8  |
+| `hammelo.bnk` | HMI (Descent:: Ham)    | 4  |
+| `rickmelo.bnk`| HMI (Descent:: Rick)   | 1  |
+
+> The banks are resolved by **name** from libADLMIDI's table, not by hardcoded index —
+> the index numbers in libADLMIDI's `inst_db.cpp` are internal data offsets, *not*
+> `adl_setBank()` ids, a trap that silently loads a neighbouring bank.
+
+### .hmp vs .hmq — which arrangement plays
+
+Many songs ship in two arrangements: `.hmp` (OPL2) and `.hmq` (OPL3). They are genuinely
+different — `.hmq` has more tracks, mid-song program changes, and uses channel 9 for real
+GM percussion, while `.hmp` puts a melodic voice there. On an OPL3 card the game loads
+`.hmq`, so **`hmpplay_opl3` prefers `.hmq` when present** (use `--hmp` to force OPL2).
+
+Conveniently, the soundtrack splits cleanly: the 14 *Asterix* songs are `.hmp`-only, and
+all 13 *Int/Ham/Rick* songs ship a `.hmq` — so every song plays in its intended form with
+no mixing of arrangements.
 
 ### Build
 
 ```bash
-g++ -std=c++17 -O2 -o hmpplay_opl3 hmpplay_opl3.cpp
-# No external dependencies
+./build.sh          # builds the bundled, baud-patched libADLMIDI, then the player
+./build.sh fast     # rebuild just the player after editing it
 ```
-
-### Instrument banks
-
-Several bank files ship inside the Descent HOG. For OPL3 playback, you want the `int`
-(internal FM synthesis) variants:
-
-```bash
-./hogtool extract descent.hog -o ./banks/ intmelo.bnk intdrum.bnk
-```
-
-| File | Use for |
-|---|---|
-| `intmelo.bnk` | Melodic FM patches — OPL/AdLib hardware |
-| `intdrum.bnk` | Percussion FM patches — OPL/AdLib hardware |
-| `melodic.bnk` / `drum.bnk` | MT-32 / General MIDI patches — wrong for OPL |
-| `hammelo.bnk` / `hamdrum.bnk` | HMI AdLib Module variant patches |
 
 ### Usage
 
 ```bash
-./hmpplay_opl3 -m ./banks/intmelo.bnk -r ./banks/intdrum.bnk ./music/
+./hmpplay_opl3 ./music/                 # whole soundtrack, per-song banks (recommended)
+./hmpplay_opl3 ./music/game01.hmp       # a single song
+./hmpplay_opl3 -l ./music/              # loop the whole soundtrack
+./hmpplay_opl3 --bank int ./music/      # force one bank for everything (A/B testing)
 ```
 
 ### Options
 
 | Option | Description |
 |---|---|
-| `-d device` | Serial device (default: `/dev/ttyACM0`) |
-| `-m melodic.bnk` | Melodic instrument bank |
-| `-r drums.bnk` | Percussion instrument bank |
-| `-D N` | HMP device index: `0`=OPL (default), `1`=MT-32, `2`=GM, `3`=GS, `4`=Tandy |
-| `-l` | Loop playlist indefinitely |
+| `-d name` | Serial device name without `/dev/` (default: `ttyACM0`) |
+| `--bank NAME` | Force one bank for every song instead of the per-song default: `int`, `ham`, `rick`, `d2`, `gm`. Handy for A/B comparisons. |
+| `-b file.wopl` | Force a custom [WOPL](https://github.com/Wohlstand/OPL3BankEditor) bank file for every song |
+| `--hmp` | Force the OPL2 `.hmp` arrangement even when a richer `.hmq` exists. By default `.hmq` is preferred — that's what Descent loads on an OPL3 card. |
+| `-D N` | HMP device track selection: `0`=OPL (default), `1`=MT-32, `2`=GM, `3`=GS |
+| `-l` | Loop the playlist indefinitely |
 | `-t scale` | Tempo multiplier (default: `1.0`) |
-| `-v` | Verbose: print device track mapping and every MIDI event |
+| `-v` | Verbose |
 
 Keyboard controls are the same as `hmpplay`.
+
+### How close is it?
+
+Very — but not bit-for-bit. libADLMIDI is a clean-room reimplementation of the OPL
+synthesis, so a few voices can differ subtly from the original game's HMI driver. For
+**byte-exact** output (and faithful `.hmq` playback with real loop points), see the
+sibling **`hmisandbox`** project, which runs Descent's actual `HMIMDRV.386` driver in an
+x86 sandbox and forwards its register writes to the same RetroWave hardware.
 
 ---
 
@@ -317,16 +356,19 @@ Each `.hmp` file stores separate track arrangements for different hardware. The 
 reads a `deviceTrackMappings` table from the HMP header and plays only the tracks
 intended for your device:
 
-| Index | Device | `hmpplay` flag | Banks needed |
+| Index | Device | `hmpplay` flag | Where the instruments come from |
 |---|---|---|---|
-| 0 | OPL / AdLib | `-D 0` | `intmelo.bnk` + `intdrum.bnk` |
-| 1 | Roland MT-32 | `--mt32` | MT-32 ROM patches (none needed) |
-| 2 | General MIDI | `--gm` | GM patches on device |
-| 3 | Roland GS | `-D 3` | `hammelo.bnk` + `hamdrum.bnk` |
+| 0 | OPL / AdLib | `-D 0` | FM patches (`hmpplay_opl3` supplies these automatically) |
+| 1 | Roland MT-32 | `--mt32` | MT-32 ROM patches on the device |
+| 2 | General MIDI | `--gm` | GM patches on the device |
+| 3 | Roland GS | `-D 3` | GS patches on the device |
 | 4 | Tandy / PS/1 | `-D 4` | — |
 
-Playing without a `-D` flag merges all tracks, which usually works but may include
-device-specific tracks not suited to your hardware.
+This index selects which *track arrangement* to play from the HMP file — it is not a bank
+file you pass in. `hmpplay` sends the chosen tracks to your MIDI device (which provides
+the sounds); `hmpplay_opl3` always uses the OPL arrangement and supplies the FM bank
+itself. Playing `hmpplay` without a `-D` flag merges all tracks, which usually works but
+may include device-specific tracks not suited to your hardware.
 
 ---
 
@@ -350,6 +392,11 @@ then, repeated until EOF:
 - Delta times: HMI little-endian VLQ (MSB-terminated, least-significant byte first — opposite of standard MIDI)
 - Tempo: `1,605,632 µs/beat` (~37.4 BPM), matching DXX-Rebirth's hardcoded SMF value
 - Track 0: conductor/setup track, always skipped during playback
+
+**descent.sng** (the song→bank list `hmpplay_opl3` reads):
+- Plain text, tab-separated, DOS CRLF line endings
+- One line per song: `song.hmp` ⇥ `melodic.bnk` ⇥ `drum.bnk`
+- Names exactly which of the four FM bank pairs each song was authored for
 
 ---
 
