@@ -298,13 +298,31 @@ no mixing of arrangements.
 
 Keyboard controls are the same as `hmpplay`.
 
-### How close is it?
+### How close is it? (and the limit of this approach)
 
-Very — but not bit-for-bit. libADLMIDI is a clean-room reimplementation of the OPL
-synthesis, so a few voices can differ subtly from the original game's HMI driver. For
-**byte-exact** output (and faithful `.hmq` playback with real loop points), see the
-sibling **`hmisandbox`** project, which runs Descent's actual `HMIMDRV.386` driver in an
-x86 sandbox and forwards its register writes to the same RetroWave hardware.
+Very close — and **about as close as you can get with modern, maintained libraries**.
+The synthesis here is done by [libADLMIDI](https://github.com/Wohlstand/libADLMIDI), a
+clean-room reimplementation of the OPL3, driven by Descent's own instrument banks. It
+sounds right, it's portable, and it needs nothing but the library.
+
+But it is *not* bit-for-bit identical to the original. Because libADLMIDI re-implements the
+OPL register generation rather than running Descent's actual sound code, a few voices can
+differ subtly from what the game produced — that's the inherent ceiling of any
+reimplementation, not a bug we can patch away.
+
+**If you need exact reproduction, the only way is emulation** — running the game's real
+sound driver and capturing what *it* sends to the chip, rather than re-deriving it. We've
+prototyped that separately: a small x86 sandbox (built on the Unicorn CPU emulator) that
+loads Descent's actual `HMIMDRV.386` HMI driver, traps the OPL register writes the driver
+makes, and forwards them byte-for-byte to the same RetroWave OPL3 hardware — output
+identical to the original, authentic `.hmq` arrangements and real loop points included.
+
+That approach inherently runs Descent's proprietary HMI driver binary, which can't be
+redistributed, so there's no prebuilt download — but the **method** is documented:
+[**docs/EXACT_REPRODUCTION.md**](docs/EXACT_REPRODUCTION.md) is a full architecture +
+recipe guide for rebuilding it yourself with your own copy of the driver. For everyday
+listening, `hmpplay_opl3` is the practical, shareable option and gets you most of the way
+there.
 
 ---
 
