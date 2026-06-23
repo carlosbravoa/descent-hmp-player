@@ -47,8 +47,15 @@ needed to pull the music and instrument banks out of the game files.
 ```bash
 sudo apt install libasound2-dev   # hmpplay only
 sudo apt install cmake             # hmpplay_opl3 (builds libADLMIDI)
+sudo apt install libsdl2-dev       # OPTIONAL — only for hmpplay_opl3 --gui
 # hogtool needs nothing beyond libc
 ```
+
+The terminal `hmpplay_opl3` needs only **cmake + a C++ compiler** (and git for the
+submodule) — no extra dependencies, no display required. SDL2 is **optional**:
+`build.sh` detects it automatically and compiles the `--gui` visualizer in only if
+it's present. Without SDL2 you get a full terminal-only player, and `--gui` simply
+prints a note and plays in the terminal.
 
 `hmpplay_opl3` depends on **libADLMIDI**, included as a git submodule. Clone with:
 

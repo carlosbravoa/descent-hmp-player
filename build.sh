@@ -137,24 +137,39 @@ else
     echo ">>> libADLMIDI installed to $INSTALL_DIR"
 fi
 
-# ── 4. Compile hmpplay_opl3 (+ SDL2 visualizer) ──────────────────────────────
+# ── 4. Compile hmpplay_opl3 ──────────────────────────────────────────────────
+# The terminal player needs only cmake + a C++ compiler. The optional --gui
+# visualizer needs SDL2; it is compiled in only if SDL2 is detected, so a
+# terminal-only user needs no extra dependencies.
 echo ">>> Compiling hmpplay_opl3..."
 
-SDL_CFLAGS="$(sdl2-config --cflags 2>/dev/null || pkg-config sdl2 --cflags)"
-SDL_LIBS="$(sdl2-config --libs 2>/dev/null || pkg-config sdl2 --libs)"
+SDL_CFLAGS="$(sdl2-config --cflags 2>/dev/null || pkg-config --cflags sdl2 2>/dev/null || true)"
+SDL_LIBS="$(sdl2-config --libs 2>/dev/null || pkg-config --libs sdl2 2>/dev/null || true)"
 
-# Software OPL3 "tee" for the visualizer (DOSBox emulator, OPL3 mode, C).
-gcc -std=gnu11 -O2 -DOPLTYPE_IS_OPL3 \
-    -c "$SCRIPT_DIR/viz/opl.c" -o "$SCRIPT_DIR/build/opl_tee.o"
+if [ -n "$SDL_LIBS" ]; then
+    echo ">>> SDL2 found — building with --gui visualizer"
+    # Software OPL3 "tee" for the visualizer (DOSBox emulator, OPL3 mode, C).
+    gcc -std=gnu11 -O2 -DOPLTYPE_IS_OPL3 \
+        -c "$SCRIPT_DIR/viz/opl.c" -o "$SCRIPT_DIR/build/opl_tee.o"
 
-g++ -std=c++17 -O2 -Wall -Wextra \
-    -I"$INSTALL_DIR/include" -I"$SCRIPT_DIR/viz" $SDL_CFLAGS \
-    "$SCRIPT_DIR/hmpplay_opl3.cpp" \
-    "$SCRIPT_DIR/viz/hmpviz.cpp" \
-    "$SCRIPT_DIR/build/opl_tee.o" \
-    -L"$INSTALL_DIR/lib" \
-    -lADLMIDI $SDL_LIBS \
-    -o "$SCRIPT_DIR/hmpplay_opl3"
+    g++ -std=c++17 -O2 -Wall -Wextra -DHAVE_GUI \
+        -I"$INSTALL_DIR/include" -I"$SCRIPT_DIR/viz" $SDL_CFLAGS \
+        "$SCRIPT_DIR/hmpplay_opl3.cpp" \
+        "$SCRIPT_DIR/viz/hmpviz.cpp" \
+        "$SCRIPT_DIR/build/opl_tee.o" \
+        -L"$INSTALL_DIR/lib" \
+        -lADLMIDI $SDL_LIBS \
+        -o "$SCRIPT_DIR/hmpplay_opl3"
+else
+    echo ">>> SDL2 not found — building terminal-only (no --gui). "
+    echo "    Install libsdl2-dev and rebuild to enable the visualizer."
+    g++ -std=c++17 -O2 -Wall -Wextra \
+        -I"$INSTALL_DIR/include" \
+        "$SCRIPT_DIR/hmpplay_opl3.cpp" \
+        -L"$INSTALL_DIR/lib" \
+        -lADLMIDI \
+        -o "$SCRIPT_DIR/hmpplay_opl3"
+fi
 
 echo ""
 echo ">>> Done: $SCRIPT_DIR/hmpplay_opl3"

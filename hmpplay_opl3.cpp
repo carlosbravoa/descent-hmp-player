@@ -58,9 +58,11 @@
 #include <unistd.h>
 #include <vector>
 
+#ifdef HAVE_GUI
 #include "viz/hmpviz.h"
 // libADLMIDI register-write tap (added to its serial backend) -> our tee.
 extern "C" { extern void (*g_retrowave_opl_tap)(uint16_t addr, uint8_t data); }
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HMP file parser
@@ -373,8 +375,10 @@ void key_thread_fn_real(PlayOptions *opts) {
     }
 }
 
+#ifdef HAVE_GUI
 // Apply a tempo scale from the GUI (runs on the main thread).
 static void gui_apply_tempo(double t) { if (g_adl) adl_setTempo(g_adl, t); }
+#endif
 
 void play_hmp(ADL_MIDIPlayer *adl, const HmpFile &hmp, const PlayOptions &opts) {
     auto smf = hmp_to_smf(hmp, opts.device);
@@ -724,7 +728,11 @@ int main(int argc, char *argv[]) {
             const char *nm = strrchr(playpath.c_str(), '/');
             nm = nm ? nm + 1 : playpath.c_str();
             printf("\n[%d/%d] %s\n", idx+1, (int)files.size(), playpath.c_str());
+#ifdef HAVE_GUI
             if (opts.gui) hmpviz_set_status(idx+1, (int)files.size(), nm);
+#else
+            (void)nm;
+#endif
 
             if (auto_bank) {
                 std::string d = dir_of(files[idx]);
@@ -761,6 +769,7 @@ int main(int argc, char *argv[]) {
     };
 
     if (opts.gui) {
+#ifdef HAVE_GUI
         g_retrowave_opl_tap = hmpviz_opl_tap;   // feed the software tee
         HmpVizHooks hooks{ &g_stop, &g_skip, &g_prev, &g_pause,
                            &opts.loop, &opts.tempo_scale, gui_apply_tempo };
@@ -776,6 +785,10 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         fprintf(stderr, "GUI init failed; falling back to terminal.\n");
+#else
+        fprintf(stderr, "--gui not available: built without SDL2. "
+                        "Install libsdl2-dev and rebuild. Playing in terminal.\n");
+#endif
     }
 
     // ── Headless (terminal) ────────────────────────────────────────────────────
