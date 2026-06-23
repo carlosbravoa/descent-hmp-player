@@ -311,16 +311,17 @@ differ subtly from what the game produced — that's the inherent ceiling of any
 reimplementation, not a bug we can patch away.
 
 **If you need exact reproduction, the only way is emulation** — running the game's real
-sound driver and capturing what *it* sends to the chip, rather than re-deriving it. We've
-prototyped that separately: a small x86 sandbox (built on the Unicorn CPU emulator) that
-loads Descent's actual `HMIMDRV.386` HMI driver, traps the OPL register writes the driver
-makes, and forwards them byte-for-byte to the same RetroWave OPL3 hardware — output
-identical to the original, authentic `.hmq` arrangements and real loop points included.
+sound driver and capturing what *it* sends to the chip, rather than re-deriving it. Our
+sibling project **[descent-hmi-original-driver](https://github.com/carlosbravoa/descent-hmi-original-driver)**
+does exactly that: a small x86 sandbox (built on the Unicorn CPU emulator) loads Descent's
+actual `HMIMDRV.386` HMI driver, traps the OPL register writes it makes, and forwards them
+byte-for-byte to the same RetroWave OPL3 hardware — output identical to the original,
+authentic `.hmq` arrangements and real loop points included.
 
 That approach inherently runs Descent's proprietary HMI driver binary, which can't be
-redistributed, so there's no prebuilt download — but the **method** is documented:
-[**docs/EXACT_REPRODUCTION.md**](docs/EXACT_REPRODUCTION.md) is a full architecture +
-recipe guide for rebuilding it yourself with your own copy of the driver. For everyday
+redistributed, so neither project ships a prebuilt player — you build it from your own copy
+of the game. The method is documented two ways: [docs/EXACT_REPRODUCTION.md](docs/EXACT_REPRODUCTION.md)
+here (architecture + recipe), and the sibling repo's own turnkey `build.sh`. For everyday
 listening, `hmpplay_opl3` is the practical, shareable option and gets you most of the way
 there.
 
@@ -401,6 +402,17 @@ then, repeated until EOF:
 - Plain text, tab-separated, DOS CRLF line endings
 - One line per song: `song.hmp` ⇥ `melodic.bnk` ⇥ `drum.bnk`
 - Names exactly which of the four FM bank pairs each song was authored for
+
+---
+
+## Related projects
+
+- **[descent-hmi-original-driver](https://github.com/carlosbravoa/descent-hmi-original-driver)**
+  — the byte-exact counterpart to this project. Instead of reimplementing the OPL3 with
+  libADLMIDI, it runs Descent's *actual* `HMIMDRV.386` HMI driver inside a small x86 sandbox
+  (Unicorn) and forwards its real register writes to the RetroWave — identical to the
+  original game, at the cost of a heavier build. Use this project (`hmpplay_opl3`) for the
+  easy, portable route; use that one when you want the genuine article.
 
 ---
 
