@@ -85,6 +85,29 @@ else:
     print(">>> WARNING: baud rate patch target not found — check opl_serial_misc.h manually")
 PYEOF
 
+# ── 2b. Patch OPL register-write tap ──────────────────────────────────────────
+# The --gui visualizer mirrors the OPL register stream into a software OPL3 tee.
+# Expose a tap callback in the serial backend's writeReg() (idempotent).
+SERIAL_PORT="$LIBADLMIDI_DIR/src/chips/opl_serial_port.cpp"
+python3 - "$SERIAL_PORT" << 'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+if 'g_retrowave_opl_tap' in src:
+    print(">>> OPL tap patch already applied"); sys.exit(0)
+glob = ('// retrowave visualizer tap (added by build.sh)\n'
+        'extern "C" { void (*g_retrowave_opl_tap)(uint16_t addr, uint8_t data) = NULL; }\n\n'
+        'OPL_SerialPort::OPL_SerialPort()')
+src2 = src.replace('OPL_SerialPort::OPL_SerialPort()', glob, 1)
+call = ('void OPL_SerialPort::writeReg(uint16_t addr, uint8_t data)\n{\n'
+        '    if(g_retrowave_opl_tap)\n        g_retrowave_opl_tap(addr, data);\n')
+src2 = src2.replace('void OPL_SerialPort::writeReg(uint16_t addr, uint8_t data)\n{\n', call, 1)
+if src2 != src:
+    open(path, 'w').write(src2); print(">>> OPL tap patch applied")
+else:
+    print(">>> WARNING: OPL tap patch targets not found — check opl_serial_port.cpp")
+PYEOF
+
 # ── 3. Build libADLMIDI (skip if 'fast' argument given and lib already exists) ─
 LIBFILE="$INSTALL_DIR/lib/libADLMIDI.a"
 
@@ -114,13 +137,23 @@ else
     echo ">>> libADLMIDI installed to $INSTALL_DIR"
 fi
 
-# ── 4. Compile hmpplay_opl3 ───────────────────────────────────────────────────
+# ── 4. Compile hmpplay_opl3 (+ SDL2 visualizer) ──────────────────────────────
 echo ">>> Compiling hmpplay_opl3..."
+
+SDL_CFLAGS="$(sdl2-config --cflags 2>/dev/null || pkg-config sdl2 --cflags)"
+SDL_LIBS="$(sdl2-config --libs 2>/dev/null || pkg-config sdl2 --libs)"
+
+# Software OPL3 "tee" for the visualizer (DOSBox emulator, OPL3 mode, C).
+gcc -std=gnu11 -O2 -DOPLTYPE_IS_OPL3 \
+    -c "$SCRIPT_DIR/viz/opl.c" -o "$SCRIPT_DIR/build/opl_tee.o"
+
 g++ -std=c++17 -O2 -Wall -Wextra \
-    -I"$INSTALL_DIR/include" \
+    -I"$INSTALL_DIR/include" -I"$SCRIPT_DIR/viz" $SDL_CFLAGS \
     "$SCRIPT_DIR/hmpplay_opl3.cpp" \
+    "$SCRIPT_DIR/viz/hmpviz.cpp" \
+    "$SCRIPT_DIR/build/opl_tee.o" \
     -L"$INSTALL_DIR/lib" \
-    -lADLMIDI \
+    -lADLMIDI $SDL_LIBS \
     -o "$SCRIPT_DIR/hmpplay_opl3"
 
 echo ""

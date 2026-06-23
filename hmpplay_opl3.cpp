@@ -58,6 +58,10 @@
 #include <unistd.h>
 #include <vector>
 
+#include "viz/hmpviz.h"
+// libADLMIDI register-write tap (added to its serial backend) -> our tee.
+extern "C" { extern void (*g_retrowave_opl_tap)(uint16_t addr, uint8_t data); }
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HMP file parser
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,6 +279,7 @@ static std::vector<uint8_t> hmp_to_smf(const HmpFile &hmp, int /*device*/) {
 static std::atomic<bool> g_stop{false};
 static std::atomic<bool> g_skip{false};
 static std::atomic<bool> g_prev{false};
+static std::atomic<bool> g_pause{false};   // GUI pause
 
 void signal_handler(int) { g_stop = true; }
 
@@ -288,6 +293,7 @@ struct PlayOptions {
     bool        force_hmp{false};    // --hmp: force OPL2 .hmp even when .hmq exists
     std::string bank_file;           // external .wopl (overrides bank_no)
     std::string serial_dev{"ttyACM0"};
+    bool        gui{false};           // --gui: SDL channel-activity visualizer
 };
 
 struct RawTerm {
@@ -367,6 +373,9 @@ void key_thread_fn_real(PlayOptions *opts) {
     }
 }
 
+// Apply a tempo scale from the GUI (runs on the main thread).
+static void gui_apply_tempo(double t) { if (g_adl) adl_setTempo(g_adl, t); }
+
 void play_hmp(ADL_MIDIPlayer *adl, const HmpFile &hmp, const PlayOptions &opts) {
     auto smf = hmp_to_smf(hmp, opts.device);
 
@@ -399,6 +408,9 @@ void play_hmp(ADL_MIDIPlayer *adl, const HmpFile &hmp, const PlayOptions &opts) 
         double prev_delay = 0.0;
 
         while (!g_stop && !g_skip) {
+            while (g_pause && !g_stop && !g_skip)   // GUI pause: hold without ticking
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
             auto t0 = clock::now();
 
             // Advance sequencer: fires OPL register writes to the serial port
@@ -571,6 +583,8 @@ static void usage(const char *prog) {
         "                     preferred — that's what Descent loads on OPL3.\n"
         "  -l               Loop playlist indefinitely\n"
         "  -t scale         Tempo multiplier (default: 1.0)\n"
+        "  --gui            Open an SDL window with an OPL3 channel-activity\n"
+        "                     visualizer (18 bars) and clickable transport\n"
         "  -v               Verbose\n"
         "  -h, --help       This help\n"
         "\n"
@@ -616,6 +630,8 @@ int main(int argc, char *argv[]) {
             if (opts.device < 0 || opts.device > 4) {
                 fprintf(stderr,"Device must be 0-4\n"); return 1;
             }
+        } else if (!strcmp(argv[i], "--gui")) {
+            opts.gui = true;
         } else if (!strcmp(argv[i], "--hmp")) {
             opts.force_hmp = true;
         } else if (!strcmp(argv[i], "-l")) {
@@ -693,56 +709,79 @@ int main(int argc, char *argv[]) {
     printf("Connected: %s\n", adl_chipEmulatorName(adl));
     printf("Playlist: %d file(s)\n", (int)files.size());
 
-    // ── Keyboard thread ───────────────────────────────────────────────────────
-    RawTerm rawterm; rawterm.enable();
-    std::thread key_thread(key_thread_fn_real, &opts);
-
-    // ── Play loop ─────────────────────────────────────────────────────────────
+    // ── Play loop (runs headless on the main thread, or on a worker in GUI) ────
     // Per-song banks come from descent.sng (unless --bank/-b forced one). Cache
     // the parsed list per directory; track the live bank to avoid redundant
     // adl_setBank() calls.
-    const bool auto_bank = !opts.explicit_bank && opts.bank_file.empty();
-    std::map<std::string, std::map<std::string,int>> sng_cache;
-    int cur_bank = opts.bank_no;
+    auto play_all = [&]() {
+        const bool auto_bank = !opts.explicit_bank && opts.bank_file.empty();
+        std::map<std::string, std::map<std::string,int>> sng_cache;
+        int cur_bank = opts.bank_no;
 
-    int idx = 0;
-    while (!g_stop && idx < (int)files.size()) {
-        std::string playpath = opts.force_hmp ? files[idx] : prefer_hmq(files[idx]);
-        printf("\n[%d/%d] %s\n", idx+1, (int)files.size(), playpath.c_str());
+        int idx = 0;
+        while (!g_stop && idx < (int)files.size()) {
+            std::string playpath = opts.force_hmp ? files[idx] : prefer_hmq(files[idx]);
+            const char *nm = strrchr(playpath.c_str(), '/');
+            nm = nm ? nm + 1 : playpath.c_str();
+            printf("\n[%d/%d] %s\n", idx+1, (int)files.size(), playpath.c_str());
+            if (opts.gui) hmpviz_set_status(idx+1, (int)files.size(), nm);
 
-        if (auto_bank) {
-            std::string d = dir_of(files[idx]);
-            auto it = sng_cache.find(d);
-            if (it == sng_cache.end())
-                it = sng_cache.emplace(d, load_song_banks(d)).first;
-            auto bit = it->second.find(song_key(files[idx]));
-            int bn = (bit != it->second.end()) ? bit->second : opts.bank_no;
-            printf("  Bank: #%d — %s%s\n", bn, adl_getBankNames()[bn],
-                   (bit == it->second.end()) ? "  (no descent.sng match — fallback)" : "");
-            fflush(stdout);
-            if (bn != cur_bank && adl_setBank(adl, bn) == 0) {
-                adl_setVolumeRangeModel(adl, ADLMIDI_VolumeModel_AUTO);
-                adl_setNumChips(adl, 1);
-                cur_bank = bn;
+            if (auto_bank) {
+                std::string d = dir_of(files[idx]);
+                auto it = sng_cache.find(d);
+                if (it == sng_cache.end())
+                    it = sng_cache.emplace(d, load_song_banks(d)).first;
+                auto bit = it->second.find(song_key(files[idx]));
+                int bn = (bit != it->second.end()) ? bit->second : opts.bank_no;
+                printf("  Bank: #%d — %s%s\n", bn, adl_getBankNames()[bn],
+                       (bit == it->second.end()) ? "  (no descent.sng match — fallback)" : "");
+                fflush(stdout);
+                if (bn != cur_bank && adl_setBank(adl, bn) == 0) {
+                    adl_setVolumeRangeModel(adl, ADLMIDI_VolumeModel_AUTO);
+                    adl_setNumChips(adl, 1);
+                    cur_bank = bn;
+                }
             }
+
+            HmpFile *hmp = nullptr;
+            try { hmp = hmp_open(playpath.c_str()); }
+            catch (const std::exception &e) {
+                fprintf(stderr,"  Error: %s\n", e.what()); idx++; continue;
+            }
+
+            g_skip = false; g_prev = false;
+            play_hmp(adl, *hmp, opts);
+            delete hmp;
+
+            if (g_stop) break;
+            if (g_prev) idx = std::max(0, idx-1);
+            else        idx++;
         }
+        g_stop = true;   // playlist ended -> signal the GUI / keyboard thread
+    };
 
-        HmpFile *hmp = nullptr;
-        try { hmp = hmp_open(playpath.c_str()); }
-        catch (const std::exception &e) {
-            fprintf(stderr,"  Error: %s\n", e.what()); idx++; continue;
+    if (opts.gui) {
+        g_retrowave_opl_tap = hmpviz_opl_tap;   // feed the software tee
+        HmpVizHooks hooks{ &g_stop, &g_skip, &g_prev, &g_pause,
+                           &opts.loop, &opts.tempo_scale, gui_apply_tempo };
+        if (hmpviz_init(&hooks)) {
+            std::thread player(play_all);
+            while (hmpviz_frame()) { /* paced by vsync */ }
+            g_stop = true;
+            player.join();
+            hmpviz_shutdown();
+            g_retrowave_opl_tap = nullptr;
+            adl_panic(adl); adl_close(adl);
+            printf("\nDone.\n");
+            return 0;
         }
-
-        g_skip = false; g_prev = false;
-        play_hmp(adl, *hmp, opts);
-        delete hmp;
-
-        if (g_stop) break;
-        if (g_prev) idx = std::max(0, idx-1);
-        else        idx++;
+        fprintf(stderr, "GUI init failed; falling back to terminal.\n");
     }
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
+    // ── Headless (terminal) ────────────────────────────────────────────────────
+    RawTerm rawterm; rawterm.enable();
+    std::thread key_thread(key_thread_fn_real, &opts);
+    play_all();
     g_stop = true;
     key_thread.join();
     rawterm.disable();

@@ -294,9 +294,31 @@ no mixing of arrangements.
 | `-D N` | HMP device track selection: `0`=OPL (default), `1`=MT-32, `2`=GM, `3`=GS |
 | `-l` | Loop the playlist indefinitely |
 | `-t scale` | Tempo multiplier (default: `1.0`) |
+| `--gui` | Open an SDL window with an OPL3 channel-activity visualizer |
 | `-v` | Verbose |
 
 Keyboard controls are the same as `hmpplay`.
+
+### Visualizer (`--gui`)
+
+```bash
+./hmpplay_opl3 --gui ./music/
+```
+
+Opens an SDL window with a synth-style **channel-activity visualizer** — one bar
+per OPL3 channel (18), driven by the real register stream sent to the board. A
+small patch (applied to libADLMIDI by `build.sh`) taps every OPL register write
+and mirrors it into a software OPL3 emulator running alongside; the bar height is
+that channel's real peak-to-peak output, so a silent channel reads zero and busy
+channels light up. Three switchable styles (LED VU / neon glow / spectrum) and
+clickable transport (prev / play-pause / next / loop / tempo).
+
+![OPL3 channel visualizer](docs/visualizer.png)
+
+Keyboard: `space` play/pause, `n`/`p` next/prev, `l` loop, `+`/`-` tempo,
+`v` cycle style, `q` quit. Requires SDL2 (`sudo apt install libsdl2-dev`).
+The visualizer shares its design with the
+[tyrian-retrowave](https://github.com/carlosbravoa/tyrian-retrowave-player) player.
 
 ### How close is it? (and the limit of this approach)
 
